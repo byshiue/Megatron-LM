@@ -312,6 +312,7 @@ def _benchmark_gated_delta_net_bwd(
         ("CUDA: delta_h",            {"FLA_CUTE_BWD_DHU": "1"}),
         ("CUDA: dqkwg",              {"FLA_CUTE_BWD_DQKWG": "1"}),
         ("CUDA: dhu+dqkwg",          {"FLA_CUTE_BWD_DHU_DQKWG": "1"}),
+        ("CUDA: dhu+dqkwg kernel",   {"FLA_CUTE_BWD_DHU_DQKWG_KERNEL": "1"}),
         ("CUDA: all three",          {"FLA_CUTE_WY_BWD": "1",
                                         "FLA_CUTE_BWD_DHU": "1",
                                         "FLA_CUTE_BWD_DQKWG": "1"}),
@@ -327,6 +328,7 @@ def _benchmark_gated_delta_net_bwd(
         "FLA_CUTE_BWD_DHU",
         "FLA_CUTE_BWD_DQKWG",
         "FLA_CUTE_BWD_DHU_DQKWG",
+        "FLA_CUTE_BWD_DHU_DQKWG_KERNEL",
     ]
 
     def _set_env(overrides):
