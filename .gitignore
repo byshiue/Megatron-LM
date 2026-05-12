@@ -1,4 +1,5 @@
-__pycache__
+__pycache__/
+*.pyc
 *.so
 build
 .coverage_*
@@ -20,3 +21,13 @@ runs/
 # Sphinx documentation
 docs/_build
 docs/apidocs
+
+# Local GDN/CUDA test scripts, profiling outputs, and logs
+debug_runs/
+perf_runs/
+profiling_runs/
+skills/
+debug.log
+*.nsys-rep
+*.sqlite
+*.qdrep

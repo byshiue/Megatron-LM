@@ -228,8 +228,8 @@ def test_parallel_gated_delta_net_correctness(tmp_path_dist_ckpt, tp, sp, cp, dt
         linear_conv_kernel_dim=2,
         linear_key_head_dim=128,
         linear_value_head_dim=128,
-        linear_num_key_heads=4,
-        linear_num_value_heads=8,
+        linear_num_key_heads=64,
+        linear_num_value_heads=64,
         num_layers=1,
         normalization="RMSNorm",
         use_cpu_initialization=True,
@@ -298,12 +298,15 @@ def _benchmark_gated_delta_net_bwd(
     Uses the same model config as test_parallel_gated_delta_net_correctness.
     """
     import os as _os
+    from contextlib import nullcontext
 
     if seq_lengths is None:
         seq_lengths = [8192]
         # seq_lengths = [1024, 2048, 4096, 8192]
 
     dtype_str = "fp16" if dtype == torch.float16 else "bf16"
+    warmup = int(_os.environ.get("MCORE_GDN_BENCH_WARMUP", warmup))
+    repeats = int(_os.environ.get("MCORE_GDN_BENCH_REPEATS", repeats))
 
     # Kernel configs to compare (name -> env var overrides)
     configs = [
@@ -312,23 +315,54 @@ def _benchmark_gated_delta_net_bwd(
         ("CUDA: delta_h",            {"FLA_CUTE_BWD_DHU": "1"}),
         ("CUDA: dqkwg",              {"FLA_CUTE_BWD_DQKWG": "1"}),
         ("CUDA: dhu+dqkwg",          {"FLA_CUTE_BWD_DHU_DQKWG": "1"}),
-        ("CUDA: dhu+dqkwg kernel",   {"FLA_CUTE_BWD_DHU_DQKWG_KERNEL": "1"}),
         ("CUDA: all three",          {"FLA_CUTE_WY_BWD": "1",
                                         "FLA_CUTE_BWD_DHU": "1",
                                         "FLA_CUTE_BWD_DQKWG": "1"}),
         ("CUDA: wy+dhu+dqkwg",       {"FLA_CUTE_WY_BWD": "1",
                                         "FLA_CUTE_BWD_DHU_DQKWG": "1"}),
     ]
+    if _os.environ.get("MCORE_GDN_BENCH_INCLUDE_UNSUPPORTED", "0") == "1":
+        configs.insert(5, ("CUDA: dhu+dqkwg kernel", {"FLA_CUTE_BWD_DHU_DQKWG_KERNEL": "1"}))
+    if _os.environ.get("MCORE_GDN_BENCH_FIVE_SCENARIOS", "0") == "1":
+        configs = [
+            ("Triton baseline", {}),
+            ("CUDA fwd_h", {"FLA_CUTE_FWD_H": "1", "CHUNK_DELTA_FWD_USE_BWD_PORT": "1"}),
+            ("CUDA fwd_h+wy_bwd", {
+                "FLA_CUTE_FWD_H": "1",
+                "CHUNK_DELTA_FWD_USE_BWD_PORT": "1",
+                "FLA_CUTE_WY_BWD": "1",
+            }),
+            ("CUDA fwd_h+wy_bwd+bwd_dhu", {
+                "FLA_CUTE_FWD_H": "1",
+                "CHUNK_DELTA_FWD_USE_BWD_PORT": "1",
+                "FLA_CUTE_WY_BWD": "1",
+                "FLA_CUTE_BWD_DHU": "1",
+            }),
+            ("CUDA all four", {
+                "FLA_CUTE_FWD_H": "1",
+                "CHUNK_DELTA_FWD_USE_BWD_PORT": "1",
+                "FLA_CUTE_WY_BWD": "1",
+                "FLA_CUTE_BWD_DHU": "1",
+                "FLA_CUTE_BWD_DQKWG": "1",
+            }),
+        ]
     if _os.environ.get("MCORE_GDN_BENCH_BASELINE_ONLY", "0") == "1":
         configs = configs[:1]
+    only = _os.environ.get("MCORE_GDN_BENCH_ONLY")
+    if only:
+        keys = [item.strip().lower() for item in only.split(",") if item.strip()]
+        configs = [cfg for cfg in configs if cfg[0] == configs[0][0] or any(key in cfg[0].lower() for key in keys)]
 
     # Env vars that control kernel dispatch
     _all_flags = [
+        "FLA_CUTE_FWD_H",
+        "CHUNK_DELTA_FWD_USE_BWD_PORT",
         "FLA_CUTE_WY_BWD",
         "FLA_CUTE_BWD_DHU",
         "FLA_CUTE_BWD_DQKWG",
         "FLA_CUTE_BWD_DHU_DQKWG",
         "FLA_CUTE_BWD_DHU_DQKWG_KERNEL",
+        "FLA_CUTE_BWD_DHU_DQKWG_DIRECT",
     ]
 
     def _set_env(overrides):
@@ -402,20 +436,37 @@ def _benchmark_gated_delta_net_bwd(
             x = torch.randn(T, B, cfg.hidden_size, device="cuda", dtype=dtype)
 
             times = []
-            for _name, env_overrides in configs:
+            for scenario_idx, (_name, env_overrides) in enumerate(configs, start=1):
                 _set_env(env_overrides)
-                # Sanitize config name into a valid NVTX range label
-                nvtx_label = f"T={T}/{dtype_str}/{_name.replace(' ', '_').replace(':', '').replace('(', '').replace(')', '')}"
+                # Keep scenario names first in NVTX so Nsight Systems groups them clearly.
+                scenario_name = _name.replace(" ", "_").replace(":", "").replace("(", "").replace(")", "")
+                scenario_label = f"scenario/{scenario_idx:02d}_{scenario_name}/T={T}/{dtype_str}"
+                iter_label = f"{scenario_label}/iter"
 
-                def fwd_bwd(model=gdn, inp=x, label=nvtx_label):
+                def fwd_bwd(model=gdn, inp=x, label=iter_label, use_nvtx=True):
                     inp = inp.detach().requires_grad_(True)
-                    with torch.cuda.nvtx.range(label):
+                    ctx = torch.cuda.nvtx.range(label) if use_nvtx else nullcontext()
+                    with ctx:
                         out, _ = model(inp, attention_mask=None)
                         out.sum().backward()
-                    torch.cuda.synchronize()
+                        torch.cuda.synchronize()
 
-                with torch.cuda.nvtx.range(f"bench/{nvtx_label}"):
-                    ms = _bench(fwd_bwd, warmup=warmup, repeats=repeats)
+                if _os.environ.get("MCORE_GDN_BENCH_NVTX_MEASURE_ONLY", "0") == "1":
+                    for _ in range(warmup):
+                        fwd_bwd(use_nvtx=False)
+                    torch.cuda.synchronize()
+                    start = torch.cuda.Event(enable_timing=True)
+                    end = torch.cuda.Event(enable_timing=True)
+                    with torch.cuda.nvtx.range(f"{scenario_label}/measured_{repeats}iters"):
+                        start.record()
+                        for _ in range(repeats):
+                            fwd_bwd(use_nvtx=True)
+                        end.record()
+                    torch.cuda.synchronize()
+                    ms = start.elapsed_time(end) / repeats
+                else:
+                    with torch.cuda.nvtx.range(f"{scenario_label}/bench"):
+                        ms = _bench(fwd_bwd, warmup=warmup, repeats=repeats)
                 times.append(ms)
 
             # Print row: absolute time for baseline, time + speedup for CUDA configs

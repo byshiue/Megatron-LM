@@ -712,6 +712,7 @@ def _test_parallel_attention_correctness(
     seed=123,
     sequence_length=256,
     micro_batch_size=4,
+    model_dtype=torch.bfloat16,
 ):
     # Model initialization function
     def initialize_gpt_model(
@@ -740,7 +741,7 @@ def _test_parallel_attention_correctness(
     input_hidden_states = (
         torch.rand((sequence_length, micro_batch_size, transformer_config.hidden_size))
         .cuda()
-        .bfloat16()
+        .to(model_dtype)
         .requires_grad_(True)
     )
 
@@ -750,7 +751,10 @@ def _test_parallel_attention_correctness(
         set_args(mock_args)
 
         # Initialize baseline model
-        init_basic_mock_args(mock_args, 1, 1, bf16=True)
+        _use_bf16 = model_dtype == torch.bfloat16
+        init_basic_mock_args(mock_args, 1, 1, bf16=_use_bf16)
+        if model_dtype == torch.float16:
+            mock_args.fp16 = True
         mock_args.context_parallel_size = 1
         mock_args.sequence_parallel = 1
         gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
@@ -790,7 +794,9 @@ def _test_parallel_attention_correctness(
         transformer_config.context_parallel_size = cp
         transformer_config.tensor_model_parallel_size = tp
         transformer_config.sequence_parallel = sp
-        init_basic_mock_args(mock_args, tp, 1, bf16=True)
+        init_basic_mock_args(mock_args, tp, 1, bf16=_use_bf16)
+        if model_dtype == torch.float16:
+            mock_args.fp16 = True
         mock_args.context_parallel_size = cp
         mock_args.sequence_parallel = sp
         gpt_model = unwrap_model(get_model(initialize_gpt_model, config=transformer_config))
