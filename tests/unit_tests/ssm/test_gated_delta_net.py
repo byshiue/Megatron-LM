@@ -428,9 +428,34 @@ def test_flashinfer_prefill_helper_flattens_batch_and_converts_log_g_to_decay():
     assert captured["k"].shape == (6, 1, 2)
     assert captured["v"].shape == (6, 1, 2)
     assert captured["cu_seqlens"].tolist() == [0, 3, 6]
+    assert captured["cu_seqlens"].dtype == torch.int32
     torch.testing.assert_close(captured["g"], torch.exp(g.float()).reshape(6, 1))
     torch.testing.assert_close(captured["beta"], beta.float().reshape(6, 1))
     torch.testing.assert_close(output.reshape(6, 1, 2), captured["q"] + captured["v"])
+
+
+def test_flashinfer_prefill_helper_uses_int32_packed_cu_seqlens():
+    from megatron.core.ssm import gated_delta_net as gdn_module
+
+    query = torch.zeros(1, 128, 1, 2)
+    key = torch.zeros_like(query)
+    value = torch.ones_like(query)
+    g = torch.zeros(1, 128, 1)
+    beta = torch.ones(1, 128, 1)
+    cu_seqlens = torch.tensor([0, 64, 128], dtype=torch.int64)
+    captured = {}
+
+    def fake_flashinfer_kernel(**kwargs):
+        captured.update(kwargs)
+        return kwargs["v"]
+
+    output = gdn_module._flashinfer_gdn_prefill_forward(
+        query, key, value, g, beta, cu_seqlens=cu_seqlens, kernel=fake_flashinfer_kernel
+    )
+
+    assert output.shape == query.shape
+    assert captured["cu_seqlens"].dtype == torch.int32
+    assert captured["cu_seqlens"].tolist() == [0, 64, 128]
 
 
 def test_flashinfer_prefill_kernel_omits_gate_log_cumsum_kwarg_by_default():

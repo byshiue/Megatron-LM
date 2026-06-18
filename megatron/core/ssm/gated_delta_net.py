@@ -142,7 +142,7 @@ def _flashinfer_prepare_flat_inputs(query, key, value, g, beta, cu_seqlens, gate
         flashinfer_cu_seqlens = _flashinfer_fixed_cu_seqlens(batch, seq_len, query.device)
         assume_valid_cu_seqlens = True
     else:
-        flashinfer_cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int64)
+        flashinfer_cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32)
         assume_valid_cu_seqlens = False
 
     query_flat = query.reshape(total_tokens, query.shape[-2], query.shape[-1]).contiguous()
