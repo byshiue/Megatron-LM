@@ -65,6 +65,15 @@ def test_triton_baseline_pins_prefill_backend():
     assert env == {"MCORE_GDN_PREFILL_BACKEND": "triton"}
 
 
+def test_non_flashinfer_scenarios_pin_triton_prefill_backend():
+    scenarios = _literal_assignment("SCENARIOS")
+
+    for key, (_label, env) in scenarios.items():
+        if key.startswith("flashinfer_prefill"):
+            continue
+        assert env.get("MCORE_GDN_PREFILL_BACKEND") == "triton", key
+
+
 def test_flashinfer_prefill_scenario_can_run_fwd_bwd():
     scenarios = _literal_assignment("SCENARIOS")
     flags = _literal_assignment("FLAGS")

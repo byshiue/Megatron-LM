@@ -20,6 +20,7 @@ from megatron.core import parallel_state
 from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
     get_experimental_attention_variant_module_spec,
 )
+from megatron.core.packed_seq_params import PackedSeqParams
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
 from megatron.core.transformer import TransformerConfig
@@ -70,19 +71,45 @@ SCENARIOS = {
     ),
     "wrapper_fla": (
         "MCore wrapper forced FLA",
-        {"MCORE_GDN_USE_OPT_WRAPPER": "1", "MCORE_GDN_OPT_BACKEND": "fla"},
+        {
+            "MCORE_GDN_PREFILL_BACKEND": "triton",
+            "MCORE_GDN_USE_OPT_WRAPPER": "1",
+            "MCORE_GDN_OPT_BACKEND": "fla",
+        },
     ),
     "wrapper_auto": (
         "MCore wrapper auto",
-        {"MCORE_GDN_USE_OPT_WRAPPER": "1", "MCORE_GDN_OPT_BACKEND": "auto"},
+        {
+            "MCORE_GDN_PREFILL_BACKEND": "triton",
+            "MCORE_GDN_USE_OPT_WRAPPER": "1",
+            "MCORE_GDN_OPT_BACKEND": "auto",
+        },
     ),
     "wrapper_cuda": (
         "MCore wrapper forced CUDA",
-        {"MCORE_GDN_USE_OPT_WRAPPER": "1", "MCORE_GDN_OPT_BACKEND": "cuda"},
+        {
+            "MCORE_GDN_PREFILL_BACKEND": "triton",
+            "MCORE_GDN_USE_OPT_WRAPPER": "1",
+            "MCORE_GDN_OPT_BACKEND": "cuda",
+        },
+    ),
+    "fwd_h": (
+        "CUDA fwd_h",
+        {
+            "MCORE_GDN_PREFILL_BACKEND": "triton",
+            "MCORE_GDN_USE_OPT_WRAPPER": "1",
+            "MCORE_GDN_OPT_BACKEND": "cuda",
+            "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
+            "MCORE_GDN_OPT_ENABLE_WY_BWD": "0",
+            "MCORE_GDN_OPT_ENABLE_DV_DHU": "0",
+            "MCORE_GDN_OPT_ENABLE_DHU": "0",
+            "MCORE_GDN_OPT_ENABLE_DQKWG": "0",
+        },
     ),
     "wy": (
         "CUDA wy_bwd",
         {
+            "MCORE_GDN_PREFILL_BACKEND": "triton",
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
             "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
@@ -95,6 +122,7 @@ SCENARIOS = {
     "dv_dhu": (
         "CUDA dv_local+delta_h fused",
         {
+            "MCORE_GDN_PREFILL_BACKEND": "triton",
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
             "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
@@ -107,6 +135,7 @@ SCENARIOS = {
     "dhu": (
         "CUDA delta_h",
         {
+            "MCORE_GDN_PREFILL_BACKEND": "triton",
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
             "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
@@ -119,6 +148,7 @@ SCENARIOS = {
     "dqkwg": (
         "CUDA dqkwg",
         {
+            "MCORE_GDN_PREFILL_BACKEND": "triton",
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
             "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
@@ -131,6 +161,7 @@ SCENARIOS = {
     "separate": (
         "CUDA all three separate",
         {
+            "MCORE_GDN_PREFILL_BACKEND": "triton",
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
             "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
@@ -141,6 +172,7 @@ SCENARIOS = {
     "dv_dhu_dqkwg": (
         "CUDA fused_dv_dhu+dqkwg",
         {
+            "MCORE_GDN_PREFILL_BACKEND": "triton",
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
             "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
@@ -152,15 +184,28 @@ SCENARIOS = {
     "all_four": (
         "CUDA fwd_h+wy_bwd+dhu+dqkwg",
         {
+            "MCORE_GDN_PREFILL_BACKEND": "triton",
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
             "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
             "MCORE_GDN_OPT_ENABLE_DV_DHU": "0",
         },
     ),
+    "fwd_h_dv_dhu_dqkwg": (
+        "CUDA fwd_h+fused_dv_dhu+dqkwg",
+        {
+            "MCORE_GDN_PREFILL_BACKEND": "triton",
+            "MCORE_GDN_USE_OPT_WRAPPER": "1",
+            "MCORE_GDN_OPT_BACKEND": "cuda",
+            "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
+            "MCORE_GDN_OPT_ENABLE_WY_BWD": "0",
+            "MCORE_GDN_OPT_ENABLE_DHU": "0",
+        },
+    ),
     "fwd_h_wy_dv_dhu_dqkwg": (
         "CUDA fwd_h+wy_bwd+fused_dv_dhu+dqkwg",
         {
+            "MCORE_GDN_PREFILL_BACKEND": "triton",
             "MCORE_GDN_USE_OPT_WRAPPER": "1",
             "MCORE_GDN_OPT_BACKEND": "cuda",
             "MCORE_GDN_OPT_ENABLE_RECOMPUTE_FWD_H": "0",
@@ -296,7 +341,7 @@ def compute_loss(output, loss):
     raise ValueError(f"unknown loss: {loss}")
 
 
-def run_once(model, x, env, loss, nvtx_label=None, use_nvtx=True):
+def run_once(model, x, env, loss, nvtx_label=None, use_nvtx=True, packed_seq_params=None):
     set_env(env)
     set_model_dispatch(model)
     print(
@@ -309,8 +354,11 @@ def run_once(model, x, env, loss, nvtx_label=None, use_nvtx=True):
     zero_grads(model)
     inp = x.detach().clone().requires_grad_(True)
     with nvtx_range(nvtx_label, enabled=use_nvtx and nvtx_label is not None):
-        out, _ = model(inp, attention_mask=None)
-        compute_loss(out, loss).backward()
+        out, _ = model(inp, attention_mask=None, packed_seq_params=packed_seq_params)
+        _loss = compute_loss(out, loss)
+        torch.cuda.nvtx.range_push("BWD_ONLY")  # profiling: backward-only window (Phase-3 task1 §4)
+        _loss.backward()
+        torch.cuda.nvtx.range_pop()
     torch.cuda.synchronize()
     grads = {
         name: param.grad.detach().float().clone().cpu()
@@ -331,7 +379,7 @@ def allclose(actual, expected, atol, rtol):
 
 
 
-def run_forward_once(model, x, env, nvtx_label=None, use_nvtx=True):
+def run_forward_once(model, x, env, nvtx_label=None, use_nvtx=True, packed_seq_params=None):
     set_env(env)
     set_model_dispatch(model)
     print(
@@ -342,20 +390,25 @@ def run_forward_once(model, x, env, nvtx_label=None, use_nvtx=True):
     )
     with torch.inference_mode():
         with nvtx_range(nvtx_label, enabled=use_nvtx and nvtx_label is not None):
-            out, _ = model(x.detach(), attention_mask=None)
+            out, _ = model(x.detach(), attention_mask=None, packed_seq_params=packed_seq_params)
     torch.cuda.synchronize()
     return out.detach().float().clone().cpu()
 
 
-def check_forward_accuracy(model, x, scenario_items, atol, rtol, use_nvtx=True):
+def check_forward_accuracy(model, x, scenario_items, atol, rtol, use_nvtx=True, packed_seq_params=None):
     base_name, base_env = SCENARIOS["baseline"]
     base_out = run_forward_once(
-        model, x, base_env, "gdn_only/00_forward_accuracy_reference/Triton_baseline", use_nvtx
+        model,
+        x,
+        base_env,
+        "gdn_only/00_forward_accuracy_reference/Triton_baseline",
+        use_nvtx,
+        packed_seq_params,
     )
     rows = []
     for scenario_idx, (_, (name, env)) in enumerate(scenario_items, start=1):
         label = f"{scenario_label(scenario_idx, name)}/forward_accuracy"
-        out = run_forward_once(model, x, env, label, use_nvtx)
+        out = run_forward_once(model, x, env, label, use_nvtx, packed_seq_params)
         rows.append(
             AccuracyRow(
                 name=name,
@@ -369,21 +422,28 @@ def check_forward_accuracy(model, x, scenario_items, atol, rtol, use_nvtx=True):
     return rows
 
 
-def forward_only(model, x, env, nvtx_label=None, use_nvtx=True):
+def forward_only(model, x, env, nvtx_label=None, use_nvtx=True, packed_seq_params=None):
     set_env(env)
     set_model_dispatch(model)
     with torch.inference_mode():
         with nvtx_range(nvtx_label, enabled=use_nvtx and nvtx_label is not None):
-            model(x.detach(), attention_mask=None)
+            model(x.detach(), attention_mask=None, packed_seq_params=packed_seq_params)
 
 
-def benchmark_forward(model, x, scenario_items, warmup, repeats, rounds, use_nvtx=True):
+def benchmark_forward(model, x, scenario_items, warmup, repeats, rounds, use_nvtx=True, packed_seq_params=None):
     rows = []
     baseline_us = None
     for scenario_idx, (_, (name, env)) in enumerate(scenario_items, start=1):
         base_label = scenario_label(scenario_idx, name)
         for warmup_idx in range(warmup):
-            forward_only(model, x, env, f"{base_label}/forward_warmup_{warmup_idx:02d}", use_nvtx)
+            forward_only(
+                model,
+                x,
+                env,
+                f"{base_label}/forward_warmup_{warmup_idx:02d}",
+                use_nvtx,
+                packed_seq_params,
+            )
         torch.cuda.synchronize()
         samples = []
         for round_idx in range(rounds):
@@ -401,6 +461,7 @@ def benchmark_forward(model, x, scenario_items, warmup, repeats, rounds, use_nvt
                         env,
                         f"{base_label}/forward_round_{round_idx:02d}/iter_{iter_idx:02d}",
                         use_nvtx,
+                        packed_seq_params,
                     )
                 end.record()
             torch.cuda.synchronize()
@@ -421,15 +482,21 @@ def benchmark_forward(model, x, scenario_items, warmup, repeats, rounds, use_nvt
     return rows
 
 
-def check_accuracy(model, x, scenario_items, loss, atol, rtol, use_nvtx=True):
+def check_accuracy(model, x, scenario_items, loss, atol, rtol, use_nvtx=True, packed_seq_params=None):
     base_name, base_env = SCENARIOS["baseline"]
     base_out, base_grad, base_params = run_once(
-        model, x, base_env, loss, "gdn_only/00_accuracy_reference/Triton_baseline", use_nvtx
+        model,
+        x,
+        base_env,
+        loss,
+        "gdn_only/00_accuracy_reference/Triton_baseline",
+        use_nvtx,
+        packed_seq_params,
     )
     rows = []
     for scenario_idx, (_, (name, env)) in enumerate(scenario_items, start=1):
         label = f"{scenario_label(scenario_idx, name)}/accuracy"
-        out, grad, params = run_once(model, x, env, loss, label, use_nvtx)
+        out, grad, params = run_once(model, x, env, loss, label, use_nvtx, packed_seq_params)
         output_ok = allclose(out, base_out, atol, rtol)
         grad_ok = allclose(grad, base_grad, atol, rtol)
         worst_param = ""
@@ -461,23 +528,40 @@ def check_accuracy(model, x, scenario_items, loss, atol, rtol, use_nvtx=True):
     return rows
 
 
-def fwd_bwd(model, x, env, loss, nvtx_label=None, use_nvtx=True):
+def fwd_bwd(model, x, env, loss, nvtx_label=None, use_nvtx=True, packed_seq_params=None):
     set_env(env)
     set_model_dispatch(model)
     zero_grads(model)
     inp = x.detach().requires_grad_(True)
     with nvtx_range(nvtx_label, enabled=use_nvtx and nvtx_label is not None):
-        out, _ = model(inp, attention_mask=None)
-        compute_loss(out, loss).backward()
+        out, _ = model(inp, attention_mask=None, packed_seq_params=packed_seq_params)
+        _loss = compute_loss(out, loss)
+        # Profiling-only (Phase-3 task1 §4): drain the forward so the backward window is clean,
+        # and tag it with the unique per-iter label so sqlite can isolate the measured CUDA backward.
+        # Gated on use_nvtx so the clean perf-timing path (NO_NVTX=1) is unaffected by the sync.
+        if use_nvtx:
+            torch.cuda.synchronize()
+            torch.cuda.nvtx.range_push(f"BWD_MEASURED/{nvtx_label or 'none'}")
+        _loss.backward()
+        if use_nvtx:
+            torch.cuda.nvtx.range_pop()
 
 
-def benchmark(model, x, scenario_items, loss, warmup, repeats, rounds, use_nvtx=True):
+def benchmark(model, x, scenario_items, loss, warmup, repeats, rounds, use_nvtx=True, packed_seq_params=None):
     rows = []
     baseline_us = None
     for scenario_idx, (_, (name, env)) in enumerate(scenario_items, start=1):
         base_label = scenario_label(scenario_idx, name)
         for warmup_idx in range(warmup):
-            fwd_bwd(model, x, env, loss, f"{base_label}/warmup_{warmup_idx:02d}", use_nvtx)
+            fwd_bwd(
+                model,
+                x,
+                env,
+                loss,
+                f"{base_label}/warmup_{warmup_idx:02d}",
+                use_nvtx,
+                packed_seq_params,
+            )
         torch.cuda.synchronize()
         samples = []
         for round_idx in range(rounds):
@@ -495,6 +579,7 @@ def benchmark(model, x, scenario_items, loss, warmup, repeats, rounds, use_nvtx=
                         loss,
                         f"{base_label}/round_{round_idx:02d}/iter_{iter_idx:02d}",
                         use_nvtx,
+                        packed_seq_params,
                     )
                 end.record()
             torch.cuda.synchronize()
@@ -515,6 +600,35 @@ def benchmark(model, x, scenario_items, loss, warmup, repeats, rounds, use_nvtx=
     return rows
 
 
+
+
+def make_input_and_packed_seq_params(args, dtype):
+    if not args.packed_varlen:
+        x = torch.randn(8192, 2, 128, device="cuda", dtype=dtype)
+        return x, None, "B=2 T=8192"
+
+    seqlens = [int(item) for item in args.packed_seqlens.split(",") if item.strip()]
+    if not seqlens:
+        raise ValueError("--packed-seqlens must contain at least one length")
+    if any(length <= 0 for length in seqlens):
+        raise ValueError(f"--packed-seqlens must be positive, got {seqlens}")
+    total_tokens = sum(seqlens)
+    cu_values = [0]
+    for length in seqlens:
+        cu_values.append(cu_values[-1] + length)
+    cu = torch.tensor(cu_values, device="cuda", dtype=torch.int32)
+    packed_seq_params = PackedSeqParams(
+        qkv_format="thd",
+        cu_seqlens_q=cu,
+        cu_seqlens_kv=cu,
+        max_seqlen_q=max(seqlens),
+        max_seqlen_kv=max(seqlens),
+        total_tokens=total_tokens,
+    )
+    x = torch.randn(total_tokens, 1, 128, device="cuda", dtype=dtype)
+    return x, packed_seq_params, f"packed_varlen seqlens={seqlens} total_T={total_tokens}"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dtype", choices=("bf16", "fp16"), default="bf16")
@@ -526,6 +640,16 @@ def parse_args():
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--atol", type=float, default=5e-3)
     parser.add_argument("--rtol", type=float, default=5e-3)
+    parser.add_argument(
+        "--packed-varlen",
+        action="store_true",
+        help="Run the layer in packed THD varlen mode instead of dense fixed-length B=2,T=8192.",
+    )
+    parser.add_argument(
+        "--packed-seqlens",
+        default="8192,8192",
+        help="Comma-separated sequence lengths for --packed-varlen. Each length should be 64-aligned.",
+    )
     parser.add_argument("--fail-on-accuracy", action="store_true")
     parser.add_argument("--no-nvtx", dest="use_nvtx", action="store_false", default=True)
     return parser.parse_args()
@@ -546,15 +670,16 @@ def main():
     torch.manual_seed(123)
     set_env({})
     print(
-        f"DEVICE {torch.cuda.get_device_name(0)} SHAPE B=2 T=8192 H=64 D=128 "
+        f"DEVICE {torch.cuda.get_device_name(0)} SHAPE pending H=64 D=128 "
         f"dtype={args.dtype} loss={args.loss}"
     )
     try:
         model = make_model(dtype).eval()
-        x = torch.randn(8192, 2, 128, device="cuda", dtype=dtype)
+        x, packed_seq_params, shape_label = make_input_and_packed_seq_params(args, dtype)
+        print(f"INPUT_SHAPE {shape_label}")
         if args.mode == "forward":
             accuracy_rows = check_forward_accuracy(
-                model, x, scenario_items, args.atol, args.rtol, args.use_nvtx
+                model, x, scenario_items, args.atol, args.rtol, args.use_nvtx, packed_seq_params
             )
             for row in accuracy_rows:
                 print(
@@ -569,10 +694,18 @@ def main():
                 args.repeats,
                 args.rounds,
                 args.use_nvtx,
+                packed_seq_params,
             )
         else:
             accuracy_rows = check_accuracy(
-                model, x, scenario_items, args.loss, args.atol, args.rtol, args.use_nvtx
+                model,
+                x,
+                scenario_items,
+                args.loss,
+                args.atol,
+                args.rtol,
+                args.use_nvtx,
+                packed_seq_params,
             )
             for row in accuracy_rows:
                 print(
@@ -591,6 +724,7 @@ def main():
                 args.repeats,
                 args.rounds,
                 args.use_nvtx,
+                packed_seq_params,
             )
         for row in perf_rows:
             print(
