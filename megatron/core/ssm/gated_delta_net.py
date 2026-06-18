@@ -238,7 +238,7 @@ def _flashinfer_prepare_backward_context(query, key, value, g, beta, cu_seqlens)
             device=query.device,
         )
     else:
-        bwd_cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int64)
+        bwd_cu_seqlens = cu_seqlens.to(device=query.device, dtype=torch.int32)
         if int(bwd_cu_seqlens[-1].item()) != total_tokens:
             raise ValueError(
                 "FlashInfer GDN prefill received cu_seqlens whose final value does not "
@@ -246,7 +246,7 @@ def _flashinfer_prepare_backward_context(query, key, value, g, beta, cu_seqlens)
             )
         from fla.ops.utils.index import prepare_chunk_indices
 
-        chunk_indices = prepare_chunk_indices(bwd_cu_seqlens, 64)
+        chunk_indices = prepare_chunk_indices(bwd_cu_seqlens, 64).to(torch.int32).contiguous()
         q_bwd = query.reshape(1, total_tokens, query.shape[-2], query.shape[-1]).contiguous()
         k_bwd = key.reshape(1, total_tokens, key.shape[-2], key.shape[-1]).contiguous()
         v_bwd = value.reshape(1, total_tokens, value.shape[-2], value.shape[-1]).contiguous()

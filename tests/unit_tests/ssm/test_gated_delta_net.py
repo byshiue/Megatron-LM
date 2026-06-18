@@ -464,6 +464,26 @@ def test_flashinfer_prefill_kernel_omits_gate_log_cumsum_kwarg_by_default():
     torch.testing.assert_close(out, v)
 
 
+def test_flashinfer_prefill_backward_context_uses_int32_varlen_metadata():
+    from megatron.core.ssm import gated_delta_net as gdn_module
+
+    query = torch.ones(1, 128, 1, 2)
+    key = torch.ones_like(query)
+    value = torch.ones_like(query)
+    g = torch.zeros(1, 128, 1)
+    beta = torch.ones(1, 128, 1)
+    cu_seqlens = torch.tensor([0, 64, 128], dtype=torch.int32)
+
+    _, _, _, _, _, output_A, bwd_cu_seqlens, chunk_indices = (
+        gdn_module._flashinfer_prepare_backward_context(query, key, value, g, beta, cu_seqlens)
+    )
+
+    assert bwd_cu_seqlens.dtype == torch.int32
+    assert chunk_indices.dtype == torch.int32
+    assert chunk_indices.is_contiguous()
+    assert output_A.shape == (1, 128, 1, 64)
+
+
 def test_flashinfer_prefill_helper_allocates_forward_context_for_autograd_inputs():
     from megatron.core.ssm import gated_delta_net as gdn_module
 
