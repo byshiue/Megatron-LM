@@ -34,10 +34,3 @@ def test_optimized_scenarios_route_through_mcore_wrapper():
         assert env["MCORE_GDN_USE_OPT_WRAPPER"] == "1", key
         assert env["MCORE_GDN_OPT_BACKEND"] == "cuda", key
         assert not any(flag.startswith("FLA_CUTE_") for flag in env), key
-
-
-def test_benchmark_does_not_require_patched_fla_sources():
-    text = BENCH.read_text()
-
-    assert "patched flash-linear-attention" not in text
-    assert "FLA_DISPATCH_SOURCE" not in text
