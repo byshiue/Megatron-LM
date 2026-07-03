@@ -584,6 +584,28 @@ class TestGatedDeltaNet:
             msg=lambda msg: f"Output mismatch ({rank=}): {msg}",
         )
 
+    def test_gpu_forward_thd_cp1_skips_sequence_unpack(self, monkeypatch):
+        if self.cp_size != 1 or self.tp_size != 1 or self.sp_size > 1:
+            pytest.skip("This regression covers single-rank packed CP=1.")
+
+        import megatron.core.ssm.gated_delta_net as gated_delta_net_module
+
+        def fail_unpack(*_args, **_kwargs):
+            raise AssertionError("packed CP=1 must not unpack and concatenate sequences")
+
+        monkeypatch.setattr(gated_delta_net_module, "_unpack_sequence", fail_unpack)
+        cu_seqlens = [0, 32, 64, 96, 128]
+        hidden_states = torch.rand(
+            (cu_seqlens[-1], 1, self.gdn.config.hidden_size),
+            device=torch.cuda.current_device(),
+            dtype=torch.bfloat16,
+        )
+        packed_seq_params = make_test_packed_seq_params(cu_seqlens=cu_seqlens)
+
+        output, _ = self.gdn(hidden_states, None, packed_seq_params=packed_seq_params)
+
+        assert output.shape == hidden_states.shape
+
     def test_gpu_forward_thd_padding_correctness(self):
         if self.sp_size > 1:
             pytest.skip("Sequence parallel is not supported for this test case.")

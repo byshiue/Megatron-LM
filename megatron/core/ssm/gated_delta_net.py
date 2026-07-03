@@ -477,7 +477,11 @@ class GatedDeltaNet(MegatronModule):
             norm_out = norm_out.transpose(0, 1).contiguous()
 
             # CP all to all: HP to CP
-            if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+            if (
+                packed_seq_params is not None
+                and packed_seq_params.qkv_format == 'thd'
+                and cp_size > 1
+            ):
                 unpacked_norm_out = _unpack_sequence(norm_out, cu_seqlens_q, dim=0)
                 outputs = []
                 for norm_out_i in unpacked_norm_out:
@@ -535,7 +539,11 @@ class GatedDeltaNet(MegatronModule):
         nvtx_range_pop(suffix="in_proj")
 
         # CP All to All: CP to HP
-        if packed_seq_params is not None and packed_seq_params.qkv_format == 'thd':
+        if (
+            packed_seq_params is not None
+            and packed_seq_params.qkv_format == 'thd'
+            and cp_size > 1
+        ):
             unpacked_qkvzba = _unpack_sequence(qkvzba, cu_seqlens_q // cp_size, dim=0)
             outputs = []
             for qkvzba_i in unpacked_qkvzba:
