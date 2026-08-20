@@ -204,8 +204,8 @@ def _fused_bwd_support_reason(
         num_sequences = q.shape[0]
         if num_sequences < 1:
             return "dense fused backward requires a positive batch size"
-        if q.shape[1] % _CHUNK_SIZE:
-            return "sequence length must be divisible by 64"
+        if q.shape[1] < 1:
+            return "dense fused backward requires a positive sequence length"
     else:
         if q.shape[0] != 1:
             return "packed fused backward requires batch size 1"
@@ -218,10 +218,8 @@ def _fused_bwd_support_reason(
         bounds = cu_seqlens.detach().cpu().tolist()
         if bounds[0] != 0 or bounds[-1] != q.shape[1]:
             return "cu_seqlens bounds do not match the packed token count"
-        if any(
-            end <= start or (end - start) % _CHUNK_SIZE for start, end in zip(bounds, bounds[1:])
-        ):
-            return "every packed sequence length must be a positive multiple of 64"
+        if any(end <= start for start, end in zip(bounds, bounds[1:])):
+            return "every packed sequence length must be positive"
         num_sequences = len(bounds) - 1
     if dht is not None and (
         dht.dtype != torch.float32
@@ -283,12 +281,17 @@ def _call_fused_gdr_bwd_cute(
         _dense_cu_seqlens(batch_size, seqlen, q.device) if cu_seqlens is None else cu_seqlens
     )
     num_sequences = launch_cu_seqlens.numel() - 1
+    bounds = launch_cu_seqlens.detach().cpu().tolist()
+    total_chunks = sum(
+        (end - start + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+        for start, end in zip(bounds, bounds[1:])
+    )
     if h is None:
         h = _recompute_fused_bwd_h(
             k=k, v=v, g=g, beta=beta, A=A, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
         )
     launch_h = _prepare_fused_bwd_h(
-        h, total_chunks=total_tokens // _CHUNK_SIZE, num_heads=num_heads, head_size=head_size
+        h, total_chunks=total_chunks, num_heads=num_heads, head_size=head_size
     ).unsqueeze(0)
     launch_g = g.detach().reshape(1, total_tokens, num_heads).to(torch.float32).contiguous()
     launch_beta = beta.detach().reshape(1, total_tokens, num_heads).to(torch.float32).contiguous()
@@ -452,13 +455,21 @@ def _can_use_fused_bwd_forward(
     if any(not tensor.is_contiguous() for tensor in (q, k, v)):
         return False
     if cu_seqlens is None:
-        return q.shape[0] >= 1 and q.shape[1] % _CHUNK_SIZE == 0
+        return q.shape[0] >= 1 and q.shape[1] >= 1
     return (
         q.shape[0] == 1
         and cu_seqlens.dtype == torch.int32
         and cu_seqlens.is_contiguous()
         and cu_seqlens.numel() >= 2
-        and _aligned_sequence_lengths(cu_seqlens, cu_seqlens_cpu)
+        and bool(
+            (
+                (cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens)[1:]
+                - (cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens)[:-1]
+                > 0
+            )
+            .all()
+            .item()
+        )
     )
 
 
@@ -544,9 +555,19 @@ def _fla_forward_for_fused_bwd(
     )
     saved_h = None
     if save_fused_bwd_state:
+        if cu_seqlens is None:
+            total_chunks = q.shape[0] * (
+                (q.shape[1] + _CHUNK_SIZE - 1) // _CHUNK_SIZE
+            )
+        else:
+            offsets = cu_seqlens_cpu if cu_seqlens_cpu is not None else cu_seqlens
+            lengths = offsets[1:] - offsets[:-1]
+            total_chunks = int(
+                ((lengths + _CHUNK_SIZE - 1) // _CHUNK_SIZE).sum().item()
+            )
         saved_h = _prepare_fused_bwd_h(
             h,
-            total_chunks=q.shape[0] * q.shape[1] // _CHUNK_SIZE,
+            total_chunks=total_chunks,
             num_heads=q.shape[2],
             head_size=q.shape[3],
         )

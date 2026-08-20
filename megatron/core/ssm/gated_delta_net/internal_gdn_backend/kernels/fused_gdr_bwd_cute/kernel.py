@@ -257,6 +257,46 @@ def _load_store_dk_bf16x2(
 
 
 @cute.jit
+def _load_store_dk_bf16x2_tail(
+    tmem_address,
+    row0_address,
+    row8_address,
+    row0,
+    row8,
+    valid_tokens,
+):
+    """Load one dK fragment and predicate both packed row stores."""
+
+    llvm.inline_asm(
+        None,
+        [
+            cutlass.Int32(tmem_address).ir_value(),
+            cutlass.Int64(row0_address).ir_value(),
+            cutlass.Int64(row8_address).ir_value(),
+            cutlass.Int32(row0).ir_value(),
+            cutlass.Int32(row8).ir_value(),
+            cutlass.Int32(valid_tokens).ir_value(),
+        ],
+        "{\n"
+        ".reg .b32 f0, f1, f2, f3, b0, b1;\n"
+        ".reg .pred p0, p1;\n"
+        "tcgen05.ld.sync.aligned.16x256b.x1.b32 "
+        "{f0, f1, f2, f3}, [$0];\n"
+        "cvt.rn.bf16x2.f32 b0, f1, f0;\n"
+        "cvt.rn.bf16x2.f32 b1, f3, f2;\n"
+        "setp.lt.s32 p0, $3, $5;\n"
+        "setp.lt.s32 p1, $4, $5;\n"
+        "@p0 st.global.b32 [$1], b0;\n"
+        "@p1 st.global.b32 [$2], b1;\n"
+        "}",
+        "r,l,l,r,r,r",
+        has_side_effects=True,
+        is_align_stack=False,
+        asm_dialect=llvm.AsmDialect.AD_ATT,
+    )
+
+
+@cute.jit
 def _direct_mma_ws(tmem_ptr, a_desc_tensor, b_desc_tensor, idesc, accumulate):
     a_desc = tcgen05.smem_descriptor_to_int(a_desc_tensor.iterator)
     b_desc = tcgen05.smem_descriptor_to_int(b_desc_tensor.iterator)
@@ -574,6 +614,7 @@ class FusedGdrBwdKernel:
         use_dht: bool = True,
         state_v_first: bool = False,
         uniform_sequence_length: int = 0,
+        enable_varlen_tail: bool = False,
         enable_iket: bool = False,
     ):
         if io_dtype is not cutlass.BFloat16:
@@ -594,10 +635,8 @@ class FusedGdrBwdKernel:
             )
         if num_sequences <= 0:
             raise ValueError("num_sequences must be positive")
-        if uniform_sequence_length < 0 or uniform_sequence_length % self.bt:
-            raise ValueError(
-                "uniform_sequence_length must be zero or a multiple of 64"
-            )
+        if uniform_sequence_length < 0:
+            raise ValueError("uniform_sequence_length must be non-negative")
 
         self.io_dtype = io_dtype
         self.acc_dtype = acc_dtype
@@ -607,6 +646,7 @@ class FusedGdrBwdKernel:
         self.use_dht = use_dht
         self.state_v_first = state_v_first
         self.uniform_sequence_length = uniform_sequence_length
+        self.enable_varlen_tail = enable_varlen_tail
         self.enable_iket = enable_iket
         self.cta_group = tcgen05.CtaGroup.ONE
         self.tmem_free_barrier = pipeline.NamedBarrier(
@@ -628,6 +668,22 @@ class FusedGdrBwdKernel:
         self.aq_reduction_barrier = pipeline.NamedBarrier(
             barrier_id=5,
             num_threads=128,
+        )
+        self.tail_sk_barrier = pipeline.NamedBarrier(
+            barrier_id=6,
+            num_threads=128,
+        )
+        self.tail_aq_barrier = pipeline.NamedBarrier(
+            barrier_id=7,
+            num_threads=128,
+        )
+        self.tail_mma_barrier = pipeline.NamedBarrier(
+            barrier_id=8,
+            num_threads=32,
+        )
+        self.tail_dq_store_barrier = pipeline.NamedBarrier(
+            barrier_id=9,
+            num_threads=32,
         )
 
     def _build_mma_layouts(self) -> BackwardLayoutPlan:
@@ -1470,6 +1526,65 @@ class FusedGdrBwdKernel:
         cute.arch.cp_async_bulk_wait_group(0, read=True)
 
     @cute.jit
+    def _zero_token_matrix_tail(
+        self,
+        smem_tensor,
+        stage,
+        valid_tokens,
+        group_tidx,
+        group_threads: cutlass.Constexpr,
+    ):
+        """Neutralize token rows that belong to the next packed sequence."""
+
+        matrix = self._transform_tmem_layout(smem_tensor)
+        invalid_values = (_BT - valid_tokens) * _DV
+        for linear in cutlass.range(
+            group_tidx, invalid_values, group_threads
+        ):
+            row = valid_tokens + linear // _DV
+            column = linear % _DV
+            matrix[row, column, stage] = self.io_dtype(0.0)
+
+    @cute.jit
+    def _zero_square_tail(
+        self,
+        smem_tensor,
+        stage,
+        valid_tokens,
+        group_tidx,
+        group_threads: cutlass.Constexpr,
+    ):
+        """Clear invalid rows and columns in one 64x64 token-local tile."""
+
+        matrix = self._transform_tmem_layout(smem_tensor)
+        for linear in cutlass.range(
+            group_tidx, _BT * _BT, group_threads
+        ):
+            row = linear // _BT
+            column = linear % _BT
+            if row >= valid_tokens:
+                matrix[row, column, stage] = self.io_dtype(0.0)
+            elif column >= valid_tokens:
+                matrix[row, column, stage] = self.io_dtype(0.0)
+
+    @cute.jit
+    def _extend_gate_tail(
+        self,
+        s_g,
+        stage,
+        vector_head,
+        valid_tokens,
+        group_tidx,
+    ):
+        """Extend the last valid cumulative gate through invalid rows."""
+
+        if group_tidx < _BT:
+            if group_tidx >= valid_tokens:
+                s_g[vector_head, group_tidx, stage] = s_g[
+                    vector_head, valid_tokens - 1, stage
+                ]
+
+    @cute.jit
     def _seed_state_half(
         self,
         accumulator,
@@ -1708,6 +1823,7 @@ class FusedGdrBwdKernel:
         s_dv_offset,
         group_tidx,
         token_offset,
+        valid_tokens,
     ):
         """Store one 64x128 BF16 tile with coalesced 128-bit vectors."""
 
@@ -1725,11 +1841,58 @@ class FusedGdrBwdKernel:
             + cutlass.Int64(s_dv_offset[group_tidx])
         )
         for iteration in cutlass.range_constexpr(8):
+            row = row_base + iteration * 8
+            if cutlass.const_expr(self.enable_varlen_tail):
+                if row < valid_tokens:
+                    tcgen05_ws.copy_bf16x8_s2g_offset(
+                        shared_base,
+                        global_base,
+                        iteration * 1024,
+                        iteration * output.stride[1] * 8 * 2,
+                    )
+            else:
+                tcgen05_ws.copy_bf16x8_s2g_offset(
+                    shared_base,
+                    global_base,
+                    iteration * 1024,
+                    iteration * output.stride[1] * 8 * 2,
+                )
+
+    @cute.jit
+    def _store_token_tile_tail(
+        self,
+        output,
+        smem_tensor,
+        group_tidx,
+        group_threads: cutlass.Constexpr,
+        token_offset,
+        head,
+        valid_tokens,
+    ):
+        """Store valid 16-byte vectors from a partial 64x128 tile."""
+
+        smem_mn_view = self._transform_tmem_layout(smem_tensor)
+        smem_base = smem_mn_view.iterator.toint()
+        vectors_per_row = _DV // 8
+        for linear in cutlass.range(
+            group_tidx, valid_tokens * vectors_per_row, group_threads
+        ):
+            row = linear // vectors_per_row
+            column = (linear % vectors_per_row) * 8
+            linear_address = smem_base + (
+                row * 64 + (column & 63) + (column // 64) * 4096
+            ) * 2
+            shared_address = linear_address ^ (
+                (linear_address >> 3) & 112
+            )
+            global_address = (
+                output.iterator.toint()
+                + cutlass.Int64((token_offset + row) * output.stride[1] * 2)
+                + cutlass.Int64(head * output.stride[2] * 2)
+                + cutlass.Int64(column * output.stride[3] * 2)
+            )
             tcgen05_ws.copy_bf16x8_s2g_offset(
-                shared_base,
-                global_base,
-                iteration * 1024,
-                iteration * output.stride[1] * 8 * 2,
+                shared_address, global_address, 0, 0
             )
 
     @cute.jit
@@ -1918,17 +2081,69 @@ class FusedGdrBwdKernel:
     def run_dq_store_warp(
         self,
         block_idx,
+        dq,
         head,
         s_dqkv,
         sequence_chunks,
         sequence_start,
+        tail_tokens,
         dq_smem_tile_ready_pipeline,
         tidx,
         tma_dq_store,
     ):
         """Drain AQ's dQ staging tile from dedicated producer warp 11."""
 
-        if tidx % 32 == 0:
+        lane = tidx % 32
+        if cutlass.const_expr(self.enable_varlen_tail):
+            if lane == 0:
+                cpasync.prefetch_descriptor(tma_dq_store[0])
+            for chunk_iteration in cutlass.range(sequence_chunks):
+                chunk_index = sequence_chunks - 1 - chunk_iteration
+                token_offset = sequence_start + chunk_index * _BT
+                valid_tokens = (
+                    tail_tokens
+                    if chunk_iteration == 0
+                    else cutlass.Int32(_BT)
+                )
+                if chunk_iteration == 0:
+                    dq_store_handle = self._consumer_at(
+                        dq_smem_tile_ready_pipeline, chunk_iteration
+                    ).wait()
+                    if valid_tokens < _BT:
+                        self._store_token_tile_tail(
+                            dq,
+                            s_dqkv,
+                            lane,
+                            32,
+                            token_offset,
+                            head,
+                            valid_tokens,
+                        )
+                    elif lane == 0:
+                        self._store_token_tile_tma(
+                            tma_dq_store,
+                            s_dqkv,
+                            token_offset,
+                            (cutlass.Int32(0), head),
+                        )
+                    self.tail_dq_store_barrier.arrive_and_wait()
+                    if lane == 0:
+                        dq_store_handle.release()
+                elif lane == 0:
+                    dq_store_handle = self._consumer_at(
+                        dq_smem_tile_ready_pipeline, chunk_iteration
+                    ).wait()
+                    self._store_token_tile_tma(
+                        tma_dq_store,
+                        s_dqkv,
+                        token_offset,
+                        (cutlass.Int32(0), head),
+                    )
+                    dq_store_handle.release()
+            if lane == 0:
+                if sequence_chunks > 0:
+                    cute.arch.cp_async_bulk_wait_group(0, read=False)
+        elif lane == 0:
             cpasync.prefetch_descriptor(tma_dq_store[0])
             for chunk_iteration in cutlass.range(sequence_chunks):
                 chunk_index = sequence_chunks - 1 - chunk_iteration
@@ -2131,6 +2346,7 @@ class FusedGdrBwdKernel:
         sequence,
         sequence_chunks,
         sequence_start,
+        tail_tokens,
         mma_input_ready_pipelines,
         sdg_ownership_order_pipeline,
         tidx,
@@ -2163,6 +2379,9 @@ class FusedGdrBwdKernel:
             )
             chunk_index = sequence_chunks - 1 - chunk_iteration
             token_offset = sequence_start + chunk_index * _BT
+            valid_tokens = (
+                tail_tokens if chunk_iteration == 0 else cutlass.Int32(_BT)
+            )
             p_inputs_sk_ready_handle = self._producer_at(
                 mma_input_ready_pipelines[_INPUT_P_READY], chunk_iteration
             ).acquire()
@@ -2172,6 +2391,13 @@ class FusedGdrBwdKernel:
                 load_tensor_pipelines[_LOAD_G], chunk_iteration
             ).wait()
             self._iket_pop_stage(block_idx, chunk_iteration)
+            if cutlass.const_expr(self.enable_varlen_tail):
+                if chunk_iteration == 0:
+                    self._extend_gate_tail(
+                        s_g, g_handle.index, vector_head, valid_tokens, tidx
+                    )
+                    cute.arch.fence_view_async_shared()
+                    self.tail_sk_barrier.arrive_and_wait()
             self._iket_push_stage(block_idx, chunk_iteration, "SK_WORK_GATE_VECTORS")
             if tidx < _BT:
                 g_value = s_g[vector_head, tidx, g_handle.index]
@@ -2291,7 +2517,10 @@ class FusedGdrBwdKernel:
                 boundary = s_db[lane] if lane < 4 else 0.0
                 boundary = cute.arch.warp_reduction_sum(boundary)
                 if lane == 0:
-                    s_dg[_BT - 1] += boundary
+                    if cutlass.const_expr(self.enable_varlen_tail):
+                        s_dg[valid_tokens - 1] += boundary
+                    else:
+                        s_dg[_BT - 1] += boundary
             self._iket_pop_stage(block_idx, chunk_iteration)
             self._iket_push_stage(block_idx, chunk_iteration, "SK_WAIT_STATE_PUBLISH")
             self.state_tmem_store_barrier.arrive_and_wait()
@@ -2324,6 +2553,7 @@ class FusedGdrBwdKernel:
                 sdg_ownership_order_pipeline,
                 tidx,
                 token_offset,
+                valid_tokens,
                 u_acc,
                 warp_idx,
                 chunk_iteration,
@@ -2350,7 +2580,7 @@ class FusedGdrBwdKernel:
             self.run_kv_consumer_late(
                 block_idx,
                 dk_acc, dk_matrix, head, mma_done_pipelines, mma_input_ready_pipelines,
-                tidx, token_offset, chunk_iteration,
+                tidx, token_offset, valid_tokens, chunk_iteration,
             )
             self._iket_push_stage(block_idx, chunk_iteration, "SK_WAIT_MMA_QT_DOG")
             dh_q_left_result_handle = self._consumer_at(
@@ -2501,6 +2731,7 @@ class FusedGdrBwdKernel:
         sdg_ownership_order_pipeline,
         tidx,
         token_offset,
+        valid_tokens,
         u_acc,
         warp_idx,
         chunk_iteration,
@@ -2706,7 +2937,7 @@ class FusedGdrBwdKernel:
             True,
         )
         self._store_token_tile_vector128(
-            dv, s_v, s_dv_offset, kv_tidx, token_offset
+            dv, s_v, s_dv_offset, kv_tidx, token_offset, valid_tokens
         )
         self._iket_push_stage(
             block_idx, chunk_iteration, "SK_V_REUSE_PUBLISH"
@@ -2732,6 +2963,13 @@ class FusedGdrBwdKernel:
             load_tensor_pipelines[_LOAD_DO], chunk_iteration
         ).wait().index
         self._iket_pop_stage(block_idx, chunk_iteration)
+        if cutlass.const_expr(self.enable_varlen_tail):
+            if chunk_iteration == 0:
+                self._zero_token_matrix_tail(
+                    s_do, loaded_do_stage, valid_tokens, kv_tidx, 128
+                )
+                cute.arch.fence_view_async_shared()
+                self.tail_sk_barrier.arrive_and_wait()
         self._iket_push_stage(
             block_idx, chunk_iteration, "SK_WAIT_DQ_STATE_DONE"
         )
@@ -2754,6 +2992,13 @@ class FusedGdrBwdKernel:
         self._iket_push_stage(block_idx, chunk_iteration, "SK_WAIT_TMA_QK")
         kv_qk_handle = kv_load_qk_consumer.wait()
         self._iket_pop_stage(block_idx, chunk_iteration)
+        if cutlass.const_expr(self.enable_varlen_tail):
+            if chunk_iteration == 0:
+                self._zero_token_matrix_tail(
+                    s_k, kv_qk_handle.index, valid_tokens, kv_tidx, 128
+                )
+                cute.arch.fence_view_async_shared()
+                self.tail_sk_barrier.arrive_and_wait()
         s_k_mn_view = self._transform_tmem_layout(s_k)
         self._iket_push_stage(block_idx, chunk_iteration, "SK_WAIT_MMA_DK_STATE")
         dk_state_handle = dk_state_mma_consumer.wait()
@@ -2947,7 +3192,10 @@ class FusedGdrBwdKernel:
             total = s_db[lane] if lane < 4 else 0.0
             total = cute.arch.warp_reduction_sum(total)
             if lane == 0:
-                s_dg[_BT - 1] -= total
+                if cutlass.const_expr(self.enable_varlen_tail):
+                    s_dg[valid_tokens - 1] -= total
+                else:
+                    s_dg[_BT - 1] -= total
         self._iket_pop_stage(block_idx, chunk_iteration)
         self._iket_push_stage(block_idx, chunk_iteration, "SK_WAIT_DK_REDUCE_PUBLISH")
         self.kv_reduction_barrier.arrive_and_wait()
@@ -2966,6 +3214,7 @@ class FusedGdrBwdKernel:
         mma_input_ready_pipelines,
         tidx,
         token_offset,
+        valid_tokens,
         chunk_iteration,
     ):
         """Finish the K path after the Stage 12 and Stage 15 inputs are ready."""
@@ -2988,12 +3237,22 @@ class FusedGdrBwdKernel:
         )
         thr_dk_t2r = tiled_dk_t2r.get_slice(kv_tidx)
         t_tr_dk = thr_dk_t2r.partition_S(dk_mn_view)
-        gdk = cute.local_tile(
-            dk_matrix, (_BT, _DK), (None, None, None)
-        )
-        gdk_tile = gdk[
-            None, None, token_offset // _BT, 0, (cutlass.Int32(0), head)
-        ]
+        if cutlass.const_expr(self.enable_varlen_tail):
+            gdk_tile = cute.domain_offset(
+                (token_offset, cutlass.Int32(0)),
+                dk_matrix[None, None, (cutlass.Int32(0), head)],
+            )
+        else:
+            gdk = cute.local_tile(
+                dk_matrix, (_BT, _DK), (None, None, None)
+            )
+            gdk_tile = gdk[
+                None,
+                None,
+                token_offset // _BT,
+                0,
+                (cutlass.Int32(0), head),
+            ]
         self._iket_push_stage(block_idx, chunk_iteration, "SK_WAIT_MMA_DK_DP")
         dk_dp_handle = dk_dp_mma_consumer.wait()
         self._iket_pop_stage(block_idx, chunk_iteration)
@@ -3018,11 +3277,21 @@ class FusedGdrBwdKernel:
             ].iterator.toint()
             for group_in_half in cutlass.range(8, unroll=2):
                 group = half * 8 + group_in_half
-                _load_store_dk_bf16x2(
-                    half_tmem_address + group_in_half * 8,
-                    row0_address + group * 16,
-                    row8_address + group * 16,
-                )
+                if cutlass.const_expr(self.enable_varlen_tail):
+                    _load_store_dk_bf16x2_tail(
+                        half_tmem_address + group_in_half * 8,
+                        row0_address + group * 16,
+                        row8_address + group * 16,
+                        store_row,
+                        store_row + 8,
+                        valid_tokens,
+                    )
+                else:
+                    _load_store_dk_bf16x2(
+                        half_tmem_address + group_in_half * 8,
+                        row0_address + group * 16,
+                        row8_address + group * 16,
+                    )
 
         cute.arch.fence_view_async_tmem_load()
         dk_da_handle.release()
@@ -3075,6 +3344,7 @@ class FusedGdrBwdKernel:
         scale,
         sequence_chunks,
         sequence_start,
+        tail_tokens,
         square_layout,
         square_tmem_ptr,
         mma_input_ready_pipelines,
@@ -3088,6 +3358,10 @@ class FusedGdrBwdKernel:
 
         vector_head = head % _TMA_VECTOR_HEADS
         for chunk_iteration in cutlass.range(sequence_chunks):
+            aq_tidx = tidx - self.aq_warp_ids[0] * 32
+            valid_tokens = (
+                tail_tokens if chunk_iteration == 0 else cutlass.Int32(_BT)
+            )
             aq_store_dq_producer = self._producer_at(
                 dq_smem_tile_ready_pipeline, chunk_iteration
             )
@@ -3145,9 +3419,15 @@ class FusedGdrBwdKernel:
             self._iket_push_stage(block_idx, chunk_iteration, "AQ_WAIT_TMA_G")
             g_handle = aq_load_g_aq_consumer.wait()
             self._iket_pop_stage(block_idx, chunk_iteration)
+            if cutlass.const_expr(self.enable_varlen_tail):
+                if chunk_iteration == 0:
+                    self._extend_gate_tail(
+                        s_g, g_handle.index, vector_head, valid_tokens, aq_tidx
+                    )
+                    cute.arch.fence_view_async_shared()
+                    self.tail_aq_barrier.arrive_and_wait()
             self._iket_push_stage(block_idx, chunk_iteration, "AQ_WORK_GAMMA")
             loaded_g_stage = g_handle.index
-            aq_tidx = tidx - self.aq_warp_ids[0] * 32
             aq_row0 = (aq_tidx // 32) * 16 + (aq_tidx % 32) // 4
             aq_row1 = aq_row0 + 8
             c_p_base = cute.make_identity_tensor((_BT, _BT))
@@ -3296,6 +3576,18 @@ class FusedGdrBwdKernel:
             a_handle = aq_load_a_consumer.wait()
             beta_handle = aq_load_beta_consumer.wait()
             self._iket_pop_stage(block_idx, chunk_iteration)
+            if cutlass.const_expr(self.enable_varlen_tail):
+                if chunk_iteration == 0:
+                    self._zero_square_tail(
+                        s_a, a_handle.index, valid_tokens, aq_tidx, 128
+                    )
+                    if aq_tidx < _BT:
+                        if aq_tidx >= valid_tokens:
+                            s_beta[
+                                vector_head, aq_tidx, beta_handle.index
+                            ] = self.io_dtype(0.0)
+                    cute.arch.fence_view_async_shared()
+                    self.tail_aq_barrier.arrive_and_wait()
             self._iket_push_stage(block_idx, chunk_iteration, "AQ_WORK_A_BETA_GAMMA")
             r_mask_load = cute.make_rmem_tensor((32,), self.acc_dtype)
             _direct_tmem_load32(mask_tmem_ptr, r_mask_load)
@@ -3354,6 +3646,13 @@ class FusedGdrBwdKernel:
             self._iket_push_stage(block_idx, chunk_iteration, "AQ_WAIT_TMA_V")
             v_handle = aq_load_v_consumer.wait()
             self._iket_pop_stage(block_idx, chunk_iteration)
+            if cutlass.const_expr(self.enable_varlen_tail):
+                if chunk_iteration == 0:
+                    self._zero_token_matrix_tail(
+                        s_v, v_handle.index, valid_tokens, aq_tidx, 128
+                    )
+                    cute.arch.fence_view_async_shared()
+                    self.tail_aq_barrier.arrive_and_wait()
             self._iket_push_stage(block_idx, chunk_iteration, "AQ_WAIT_MMA_U")
             u_handle = u_state_mma_consumer.wait()
             self._iket_pop_stage(block_idx, chunk_iteration)
@@ -3766,6 +4065,13 @@ class FusedGdrBwdKernel:
             self._iket_push_stage(block_idx, chunk_iteration, "AQ_WAIT_TMA_QK")
             aq_qk_handle = aq_load_qk_consumer.wait()
             self._iket_pop_stage(block_idx, chunk_iteration)
+            if cutlass.const_expr(self.enable_varlen_tail):
+                if chunk_iteration == 0:
+                    self._zero_token_matrix_tail(
+                        s_q, aq_qk_handle.index, valid_tokens, aq_tidx, 128
+                    )
+                    cute.arch.fence_view_async_shared()
+                    self.tail_aq_barrier.arrive_and_wait()
             self._iket_push_stage(block_idx, chunk_iteration, "AQ_WORK_DQ_STATE")
             for sub in cutlass.range(r_dq.shape[2], unroll_full=True):
                 cute.copy(
@@ -4231,7 +4537,11 @@ class FusedGdrBwdKernel:
             self._iket_push_stage(
                 block_idx, chunk_iteration, "AQ_OUTPUT_STORE"
             )
-            if aq_tidx < _BT:
+            if cutlass.const_expr(self.enable_varlen_tail):
+                if aq_tidx < valid_tokens:
+                    dg[0, token_offset + aq_tidx, head] = s_dg[aq_tidx]
+                    db[0, token_offset + aq_tidx, head] = s_db[aq_tidx]
+            elif aq_tidx < _BT:
                 dg[0, token_offset + aq_tidx, head] = s_dg[aq_tidx]
                 db[0, token_offset + aq_tidx, head] = s_db[aq_tidx]
             self._iket_pop_stage(block_idx, chunk_iteration)
@@ -4280,6 +4590,9 @@ class FusedGdrBwdKernel:
         mma_dk_da,
         primary_tmem_ptr,
         da_tmem_ptr,
+        s_do,
+        s_k,
+        s_q,
         s_a_p6,
         s_a_p7,
         s_do_p0,
@@ -4318,6 +4631,7 @@ class FusedGdrBwdKernel:
         s_tmp41_p8,
         s_tmp41_p9,
         sequence_chunks,
+        tail_tokens,
         square_tmem_ptr,
         mma_input_ready_pipelines,
         all_tmem_readers_done_pipeline,
@@ -4327,6 +4641,9 @@ class FusedGdrBwdKernel:
         """Run warp 8 tcgen05 MMA production."""
 
         for chunk_iteration in cutlass.range(sequence_chunks):
+            valid_tokens = (
+                tail_tokens if chunk_iteration == 0 else cutlass.Int32(_BT)
+            )
             if chunk_iteration > 0:
                 self._iket_push_stage(
                     block_idx, chunk_iteration, "MMA_WAIT_TMEM_REUSE"
@@ -4381,6 +4698,17 @@ class FusedGdrBwdKernel:
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_WAIT_TMA")
             qk_handle = mma_load_qk_consumer.wait()
             self._iket_pop_stage(block_idx, chunk_iteration)
+            if cutlass.const_expr(self.enable_varlen_tail):
+                if chunk_iteration == 0:
+                    mma_tidx = cute.arch.lane_idx()
+                    self._zero_token_matrix_tail(
+                        s_q, qk_handle.index, valid_tokens, mma_tidx, 32
+                    )
+                    self._zero_token_matrix_tail(
+                        s_k, qk_handle.index, valid_tokens, mma_tidx, 32
+                    )
+                    cute.arch.fence_view_async_shared()
+                    self.tail_mma_barrier.arrive_and_wait()
             p_handle = p_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
             tiled_mma = mma_p
@@ -4475,6 +4803,17 @@ class FusedGdrBwdKernel:
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_WAIT_TMA")
             do_handle = mma_load_do_consumer.wait()
             self._iket_pop_stage(block_idx, chunk_iteration)
+            if cutlass.const_expr(self.enable_varlen_tail):
+                if chunk_iteration == 0:
+                    self._zero_token_matrix_tail(
+                        s_do,
+                        do_handle.index,
+                        valid_tokens,
+                        cute.arch.lane_idx(),
+                        32,
+                    )
+                    cute.arch.fence_view_async_shared()
+                    self.tail_mma_barrier.arrive_and_wait()
             dvprime_pg_handle = dvprime_pgamma_mma_producer.acquire()
             self._iket_push_stage(block_idx, chunk_iteration, "MMA_ISSUE")
             tiled_mma = mma_dvprime_pg
@@ -5261,15 +5600,16 @@ class FusedGdrBwdKernel:
         sequence = block_idx // self.heads
         head = block_idx % self.heads
         if cutlass.const_expr(self.uniform_sequence_length != 0):
-            sequence_chunks = cutlass.Int32(
-                self.uniform_sequence_length // self.bt
-            )
+            sequence_length = cutlass.Int32(self.uniform_sequence_length)
+            sequence_chunks = cute.ceil_div(sequence_length, self.bt)
             sequence_start = sequence * self.uniform_sequence_length
             chunk_base = sequence * sequence_chunks
         else:
             sequence_start = cu_seqlens[sequence]
+            sequence_length = cu_seqlens[sequence + 1] - sequence_start
             chunk_base = chunk_offsets[sequence]
             sequence_chunks = chunk_offsets[sequence + 1] - chunk_base
+        tail_tokens = sequence_length - (sequence_chunks - 1) * self.bt
 
         if warp_idx == self.tma_warp_id:
             if cutlass.const_expr(self.enable_iket):
@@ -5317,10 +5657,12 @@ class FusedGdrBwdKernel:
                     _cute_iket.range_push("WG2_STORE")
             self.run_dq_store_warp(
                 block_idx,
+                dq,
                 head,
                 s_dqkv,
                 sequence_chunks,
                 sequence_start,
+                tail_tokens,
                 dq_smem_tile_ready_pipeline,
                 tidx,
                 tma_dq_store,
@@ -5370,6 +5712,7 @@ class FusedGdrBwdKernel:
                 sequence,
                 sequence_chunks,
                 sequence_start,
+                tail_tokens,
                 mma_input_ready_pipelines,
                 sdg_ownership_order_pipeline,
                 tidx,
@@ -5428,6 +5771,7 @@ class FusedGdrBwdKernel:
                 scale,
                 sequence_chunks,
                 sequence_start,
+                tail_tokens,
                 square_layout,
                 square_tmem_ptr,
                 mma_input_ready_pipelines,
@@ -5474,6 +5818,9 @@ class FusedGdrBwdKernel:
                 mma_dk_da,
                 primary_tmem_ptr,
                 da_tmem_ptr,
+                s_do,
+                s_k,
+                s_q,
                 s_a_p6,
                 s_a_p7,
                 s_do_p0,
@@ -5512,6 +5859,7 @@ class FusedGdrBwdKernel:
                 s_tmp41_p8,
                 s_tmp41_p9,
                 sequence_chunks,
+                tail_tokens,
                 square_tmem_ptr,
                 mma_input_ready_pipelines,
                 all_tmem_readers_done_pipeline,

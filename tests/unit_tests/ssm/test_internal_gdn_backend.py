@@ -385,8 +385,10 @@ def test_fused_backward_adapter_packs_dense_batch(monkeypatch, use_saved_h):
     "dtype, batch_size, seqlen, offsets, expected_reason",
     [
         (torch.bfloat16, 2, 64, None, None),
+        (torch.bfloat16, 2, 65, None, None),
         (torch.float16, 2, 64, None, "fused backward requires bf16 inputs"),
         (torch.bfloat16, 1, 256, [0, 64, 192, 256], None),
+        (torch.bfloat16, 1, 257, [0, 65, 192, 257], None),
     ],
 )
 def test_fused_backward_shape_and_dtype_contract(
@@ -412,6 +414,28 @@ def test_fused_backward_shape_and_dtype_contract(
     )
 
     assert reason == expected_reason
+
+
+def test_fused_backward_metadata_uses_per_sequence_ceil_chunks():
+    from megatron.core.ssm.gated_delta_net.internal_gdn_backend.kernels.fused_gdr_bwd_cute import (
+        fused_bwd,
+    )
+
+    offsets = torch.tensor([0, 65, 128], dtype=torch.int32)
+    metadata = fused_bwd._prepare_varlen_metadata(offsets, total_tokens=128, chunk_size=64)
+
+    assert metadata.chunk_offsets.tolist() == [0, 2, 3]
+    assert metadata.num_sequences == 2
+    assert metadata.num_chunks == 3
+    assert metadata.uniform_sequence_length == 0
+    assert metadata.has_partial_chunks is True
+
+    uniform_tail_offsets = torch.tensor([0, 65, 130], dtype=torch.int32)
+    uniform_tail = fused_bwd._prepare_varlen_metadata(
+        uniform_tail_offsets, total_tokens=130, chunk_size=64
+    )
+    assert uniform_tail.uniform_sequence_length == 0
+    assert uniform_tail.has_partial_chunks is True
 
 
 def test_fused_backward_kernel_uses_named_layout_contracts():

@@ -77,11 +77,12 @@ fused kernels run and compares the full forward-plus-backward path with FLA.
 - `q`, `k`, `v`, and `do`: BF16 `[1, N, 64, 128]`.
 - `a`: BF16 `[1, N, 64, 64]`.
 - `g` and `beta`: FP32 `[1, N, 64]`.
-- `h`: BF16 `[1, N / 64, 64, 128, 128]`.
+- `h`: BF16 `[1, C, 64, 128, 128]`, where
+  `C = sum(ceil(sequence_length / 64))`.
 - `dht`: FP32 `[B, 64, 128, 128]`.
 - `cu_seqlens`: contiguous CUDA int32 `[B + 1]`, starts at zero, ends at `N`,
-  and describes `B` logical sequences. Each sequence length is a positive
-  multiple of 64.
+  and describes `B` positive-length logical sequences. Sequence lengths do
+  not need to be multiples of 64.
 - `chunk_size=64`, `state_v_first=False`, no grouped-query head mapping, and a
   finite positive `scale`.
 
@@ -99,6 +100,13 @@ The kernel launches one CTA for each logical `(sequence, head)` pair and walks
 that sequence's 64-token chunks in reverse. It keeps recurrent state gradients
 and MMA accumulators in TMEM while using TMA and mbarrier pipelines to stage
 Q/K/V, gates, beta, `A`, output gradients, and saved forward states.
+
+For a final partial chunk, the kernel computes `valid_tokens` from the logical
+sequence boundary. Invalid rows are neutralized in shared memory before use,
+the cumulative gate is extended from the last valid row, and every token
+gradient store is predicated by `valid_tokens`. No padded token tensor is
+allocated and no input is copied. The aligned specialization retains the
+existing unmasked TMA load/store path.
 
 The pinned MMA schedule has 16 dependency phases. In broad terms it:
 

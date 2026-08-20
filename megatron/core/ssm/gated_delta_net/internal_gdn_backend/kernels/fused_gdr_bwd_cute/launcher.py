@@ -30,6 +30,7 @@ class _CompileCacheKey:
     device_index: int
     capability: tuple[int, int]
     uniform_sequence_length: int = 0
+    enable_varlen_tail: bool = False
     enable_iket: bool = False
 
 
@@ -143,12 +144,20 @@ def _resolve_device_index(device: torch.device) -> int:
 
 
 def _build_compile_descriptors(
-    input_tensors: tuple[torch.Tensor, ...], output_tensors: tuple[torch.Tensor, ...]
+    input_tensors: tuple[torch.Tensor, ...],
+    output_tensors: tuple[torch.Tensor, ...],
+    *,
+    enable_varlen_tail: bool,
 ):
     q, k, v, a, g, beta, do, dht, h, cu_seqlens, chunk_offsets = input_tensors
     dq, dk, dv, dg, db, dh0 = output_tensors
-    token_inputs = _mark_dynamic_mode_many((q, k, v, a, g, beta, do), _BT)
-    token_outputs = _mark_dynamic_mode_many((dq, dk, dv, dg, db), _BT)
+    token_divisibility = 1 if enable_varlen_tail else _BT
+    token_inputs = _mark_dynamic_mode_many(
+        (q, k, v, a, g, beta, do), token_divisibility
+    )
+    token_outputs = _mark_dynamic_mode_many(
+        (dq, dk, dv, dg, db), token_divisibility
+    )
     return (
         *token_inputs,
         from_dlpack(dht, assumed_align=16),
@@ -188,6 +197,7 @@ def _make_compile_key(
     uniform_sequence_length: int,
     device_index: int,
     capability: tuple[int, int],
+    enable_varlen_tail: bool,
     enable_iket: bool,
 ) -> _CompileCacheKey:
     return _CompileCacheKey(
@@ -201,6 +211,7 @@ def _make_compile_key(
         uniform_sequence_length=uniform_sequence_length,
         device_index=device_index,
         capability=capability,
+        enable_varlen_tail=enable_varlen_tail,
         enable_iket=enable_iket,
     )
 
@@ -215,6 +226,7 @@ def _compile_artifacts(
     grouped_heads: int,
     num_sequences: int,
     uniform_sequence_length: int,
+    enable_varlen_tail: bool,
     enable_iket: bool,
 ) -> _CompiledKernelArtifacts:
     q, _k, _v, _a, _g, _beta, _do, dht, *_ = input_tensors
@@ -227,11 +239,16 @@ def _compile_artifacts(
         use_dht=True,
         state_v_first=False,
         uniform_sequence_length=uniform_sequence_length,
+        enable_varlen_tail=enable_varlen_tail,
         enable_iket=enable_iket,
     )
     compiled = cute.compile(
         kernel,
-        *_build_compile_descriptors(input_tensors, output_tensors),
+        *_build_compile_descriptors(
+            input_tensors,
+            output_tensors,
+            enable_varlen_tail=enable_varlen_tail,
+        ),
         scale,
         driver_stream,
         options="--enable-tvm-ffi --opt-level 2",
@@ -253,6 +270,7 @@ def prepare_fused_gdr_bwd_launch(
         raise ValueError("grouped_heads must equal heads; GQA head mapping is unsupported")
 
     uniform_sequence_length = getattr(metadata, "uniform_sequence_length", 0)
+    enable_varlen_tail = getattr(metadata, "has_partial_chunks", False)
     num_sequences = metadata.num_sequences
     enable_iket = os.environ.get("FUSED_GDR_BWD_ENABLE_IKET") == "1"
     input_tensors = (q, k, v, a, g, beta, do, dht, h, cu_seqlens, chunk_offsets)
@@ -270,6 +288,7 @@ def prepare_fused_gdr_bwd_launch(
         uniform_sequence_length=uniform_sequence_length,
         device_index=device_index,
         capability=capability,
+        enable_varlen_tail=enable_varlen_tail,
         enable_iket=enable_iket,
     )
 
@@ -283,6 +302,7 @@ def prepare_fused_gdr_bwd_launch(
             grouped_heads=grouped_heads,
             num_sequences=num_sequences,
             uniform_sequence_length=uniform_sequence_length,
+            enable_varlen_tail=enable_varlen_tail,
             enable_iket=enable_iket,
         )
 
