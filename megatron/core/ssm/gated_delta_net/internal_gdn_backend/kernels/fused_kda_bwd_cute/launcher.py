@@ -98,6 +98,7 @@ def fused_kda_bwd(
     *,
     chunk_offsets=None,
     split=None,
+    tape=None,
     debug=False,
     trace=False,
 ):
@@ -127,12 +128,25 @@ def fused_kda_bwd(
         chunk_offsets = chunk_offsets_for(cu_seqlens)
     _validate(q, k, v, gc, beta, aqk, akk, h, do, dht, cu_seqlens, chunk_offsets)
     heads = q.shape[2]
-    if split is None:
-        split = default_split(cu_seqlens.numel() - 1, heads, q.device)
+    if tape is not None:
+        # (dh, dv_new) from a separate dS recurrence: BF16 [1, C, H, 128, 128]
+        # (the dS of every chunk) and BF16 [1, T, H, 128].
+        dh_tape, dv_new = tape
+        _require("dh", dh_tape, torch.bfloat16, tuple(h.shape), q.device)
+        _require("dv_new", dv_new, torch.bfloat16, tuple(v.shape), q.device)
+        if split is None:
+            split = 2
+    else:
+        dh_tape, dv_new = h, v
+        if split is None:
+            split = default_split(cu_seqlens.numel() - 1, heads, q.device)
     dq, dk, dv = torch.empty_like(q), torch.empty_like(k), torch.empty_like(v)
     dg = torch.empty_like(gc)
     dbeta = torch.empty_like(beta)
     dh0 = torch.empty_like(dht)
+    # Two-CTA split: per (sequence, head) and CTA, the FP32 dS handed to the other CTA.
+    xfer_rows = (cu_seqlens.numel() - 1) * heads * 2 if split == 2 and tape is None else 1
+    xfer = torch.empty((xfer_rows, _D, _D), device=q.device, dtype=torch.float32)
     debug_shape = (h.shape[1], heads, len(DEBUG_SLOTS), _BT, _D) if debug else (1, 1, 1, 1, 1)
     debug_out = torch.zeros(debug_shape, device=q.device, dtype=torch.float32)
     trace_out = torch.zeros((4, 8, 16) if trace else (1, 1, 1), device=q.device, dtype=torch.int64)
@@ -144,22 +158,27 @@ def fused_kda_bwd(
     args = (
         *(_dynamic(t, 1) for t in token_inputs),
         _dynamic(h, 1),
+        _dynamic(dh_tape, 1),
+        _dynamic(dv_new, 1),
         _dynamic(do, 1),
         _dynamic(dht, 0),
         _dynamic(cu_seqlens, 0, align=4),
         _dynamic(chunk_offsets, 0, align=4),
         *(_dynamic(t, 1) for t in token_outputs),
         _dynamic(dh0, 0),
+        _dynamic(xfer, 0),
         from_dlpack(debug_out, assumed_align=16),
         from_dlpack(trace_out, assumed_align=16),
     )
     stream = cuda.CUstream(torch.cuda.current_stream(q.device).cuda_stream)
     device_index = q.device.index if q.device.index is not None else torch.cuda.current_device()
-    key = (heads, split, debug, trace, device_index)
+    key = (heads, split, tape is not None, debug, trace, device_index)
     with _LOCK:
         compiled = _CACHE.get(key)
         if compiled is None:
-            kernel = FusedKdaBwdKernel(heads=heads, split=split, debug=debug, trace=trace)
+            kernel = FusedKdaBwdKernel(
+                heads=heads, split=split, tape=tape is not None, debug=debug, trace=trace
+            )
             compiled = cute.compile(kernel, *args, cutlass.Float32(scale), stream)
             _CACHE[key] = compiled
     compiled(*args, cutlass.Float32(scale), stream)
