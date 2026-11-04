@@ -191,7 +191,19 @@ def fused_kda_bwd(
 
 
 def kda_dhu(
-    q, k, gc, beta, aqk, akk, do, dht, cu_seqlens, scale, *, chunk_offsets=None, num_chunks=None,
+    q,
+    k,
+    gc,
+    beta,
+    aqk,
+    akk,
+    do,
+    dht,
+    cu_seqlens,
+    scale,
+    *,
+    chunk_offsets=None,
+    num_chunks=None,
     trace=False,
 ):
     """KDA's backward state recurrence from the forward residuals.
@@ -228,7 +240,9 @@ def kda_dhu(
     _require("dht", dht, torch.float32, (num_sequences, heads, _D, _D), device)
     if num_chunks is None:
         num_chunks = (tokens + _BT - 1) // _BT + num_sequences
-    qg, kg, w, aqk_masked = kda_dhu_prep(q, k, gc, beta, aqk, akk, cu_seqlens, chunk_offsets, num_chunks)
+    qg, kg, w, aqk_masked = kda_dhu_prep(
+        q, k, gc, beta, aqk, akk, cu_seqlens, chunk_offsets, num_chunks
+    )
     dh = torch.empty((1, num_chunks, heads, _D, _D), device=device, dtype=torch.bfloat16)
     dv2 = torch.empty_like(do)
     dh0 = torch.empty_like(dht)
@@ -249,7 +263,9 @@ def kda_dhu(
     with _LOCK:
         compiled = _CACHE.get(key)
         if compiled is None:
-            compiled = cute.compile(KdaDhuKernel(heads=heads, trace=trace), *args, cutlass.Float32(scale), stream)
+            compiled = cute.compile(
+                KdaDhuKernel(heads=heads, trace=trace), *args, cutlass.Float32(scale), stream
+            )
             _CACHE[key] = compiled
     compiled(*args, cutlass.Float32(scale), stream)
     if trace:
