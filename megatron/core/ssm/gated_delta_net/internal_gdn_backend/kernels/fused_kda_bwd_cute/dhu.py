@@ -5,20 +5,23 @@ With dS the gradient of the chunk-end state (initially dht) and G_last the
 chunk's last valid log2 gate row, each chunk:
 
 * stores dS as this chunk's tape row (BF16 ``[K, V]``);
-* dv2 = dv + kg dS, stored as dv_new (``kg = k 2^(G_last - G)``);
+* dv2 = Aqk^T dO + kg dS, stored as dv_new (``kg = k 2^(G_last - G)``);
 * dS <- 2^G_last dS + scale qg^T dO - w^T dv2.
 
-These are the semantics of FLA's ``chunk_gated_delta_rule_bwd_dhu`` with a
-per-key gate.  Only this recurrence is serial, so the kernel keeps its chain
+These are the semantics of FLA's ``chunk_kda_bwd_dAv`` (dv) followed by
+``chunk_gated_delta_rule_bwd_dhu`` with a per-key gate; qg, kg, w and the
+causally masked Aqk come from ``prep``.  Only this recurrence is serial, so the kernel keeps its chain
 short: dS lives in the registers of warps 0-3 (thread = key channel), every
 product has the 128 key or value channels on TMEM lanes, and qg^T dO for the
 next chunk is issued while the state warps finish the current update.
 
-Per chunk, the chain is: state warps publish BF16 dS -> MMA dv2^T = dS^T kg^T
--> value warps (thread = value channel) add dv and publish -(dv2 / scale) ->
+Per chunk, the chain is: state warps publish BF16 dS -> MMA dv2^T = dv^T +
+dS^T kg^T, with dv^T = dO^T Aqk already in the accumulator -> value warps
+(thread = value channel) publish -(dv2 / scale) ->
 MMA acc += w^T (-(dv2 / scale)) -> state warps dS = 2^G_last dS + scale acc,
 where acc already holds qg^T dO.  The tape row, the dv2 rows and the next
-gate row are written or loaded off that chain.
+gate row are written or loaded off that chain, and the next chunk's qg^T dO
+and dv^T are issued while the state warps update dS.
 
 Ragged tails: rows of the first (partial) chunk past the sequence end are
 zeroed in dv2 and in the dO tile, so they contribute nothing.
@@ -28,7 +31,6 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 import cutlass.utils
-from cutlass._mlir import ir
 from cutlass._mlir.dialects import llvm
 from cutlass.cute.nvgpu import cpasync, tcgen05, warpgroup
 
@@ -40,7 +42,6 @@ from .kernel import (
     _copy_bf16x8_s2g,
     _globaltimer,
     _ldg_f32,
-    _lds_bf16,
     _swz_state,
     _swz_token,
     _tmem_ldn_async,
@@ -63,25 +64,26 @@ _STATE_REGISTERS = 240
 _VALUE_REGISTERS = 168
 _OTHER_REGISTERS = 40
 _TMEM_COLUMNS = 512
-import os as _os
-
-_SET_REGISTERS = _os.environ.get("KDHU_REGS", "1") == "1"
 # TMEM columns: dv2^T (128 value lanes x 64 tokens), then two dS update
 # accumulators (128 key lanes x 128 values) used by alternate chunks.
 _ACC_DV2 = 0
 _ACC_DS = 64
 
-(_B_LOAD, _B_EMPTY, _B_S_READY, _B_D1, _B_DV2_READY, _B_D2) = (0, 2, 4, 5, 6, 7)
-_NUM_BARRIERS = 9
-# EMPTY: the MMA commit plus the value warps once the dv2 rows are out.
-_EMPTY_COUNT = 2
+# Two load groups per stage, each released by an MMA commit: A = (kg, qg,
+# dO, Aqk) once gemm1 is done, B = w once gemm2 is done.
+(_B_LOAD_A, _B_LOAD_B, _B_EMPTY_A, _B_EMPTY_B, _B_S_READY, _B_D1, _B_DV2_READY, _B_D2) = (
+    0, 2, 4, 6, 8, 9, 10, 11,
+)
+_NUM_BARRIERS = 13
 
 _BAR_STATE = 1
 _BAR_VALUE = 2
 _BAR_ALL = 3
 
 _TILE = _BT * _DK
-_INPUTS = 5
+_SQUARE = _BT * _BT
+_BYTES_A = 3 * _TILE * 2 + _SQUARE * 2
+_BYTES_B = _TILE * 2
 
 
 def _tile(dtype, elements):
@@ -92,16 +94,18 @@ def _tile(dtype, elements):
 class DhuStorage:
     bars: cute.struct.MemRange[cutlass.Int64, 16]
     tmem_holding: cute.struct.MemRange[cutlass.Int32, 1]
-    # Two stages of the TMA inputs, one 64x128 token tile each.  The dv tile
-    # is overwritten with dv2 before it is copied out.
+    # Two stages of the TMA inputs: four 64x128 token tiles and the 64x64
+    # masked Aqk.
     sKg: _tile(cutlass.BFloat16, 2 * _TILE)
     sW: _tile(cutlass.BFloat16, 2 * _TILE)
     sQg: _tile(cutlass.BFloat16, 2 * _TILE)
     sDo: _tile(cutlass.BFloat16, 2 * _TILE)
-    sDv: _tile(cutlass.BFloat16, 2 * _TILE)
+    sAqk: _tile(cutlass.BFloat16, 2 * _SQUARE)
     # BF16 dS (gemm1 A, MN-major) and -(dv2 / scale)^T (gemm2 B, two 64x64 K-major halves).
     sS: _tile(cutlass.BFloat16, _DK * _DV)
     sDv2: _tile(cutlass.BFloat16, _DV * _BT)
+    # dv2 rows, copied out to dv_new.
+    sOut: _tile(cutlass.BFloat16, _TILE)
 
 
 @cute.jit
@@ -189,7 +193,7 @@ class KdaDhuKernel:
         w: cute.Tensor,
         qg: cute.Tensor,
         do: cute.Tensor,
-        dv: cute.Tensor,
+        aqk: cute.Tensor,
         gc: cute.Tensor,
         dht: cute.Tensor,
         cu_seqlens: cute.Tensor,
@@ -204,14 +208,22 @@ class KdaDhuKernel:
         plan = build_kda_layout_plan(self.io_dtype, self.acc_dtype)
         load_op = cpasync.CopyBulkTensorTileG2SOp(tcgen05.CtaGroup.ONE)
         token = plan.variants["mm_64_64_128_k_k"]
+        square = plan.variants["mm_64_64_64_k_k"]
         tma = [
             _wrap_tma(
                 cute.nvgpu.make_tiled_tma_atom_A(
                     load_op, self._token_matrix(x), token.smem_a, token.spec.tile, token.tiled_mma
                 )
             )
-            for x in (kg, w, qg, do, dv)
+            for x in (kg, w, qg, do)
         ]
+        tma.append(
+            _wrap_tma(
+                cute.nvgpu.make_tiled_tma_atom_A(
+                    load_op, self._token_matrix(aqk), square.smem_a, square.spec.tile, square.tiled_mma
+                )
+            )
+        )
         store_op = cpasync.CopyBulkTensorTileS2GOp()
         tma_tape = _wrap_tma(
             cpasync.make_tiled_tma_atom(
@@ -241,10 +253,11 @@ class KdaDhuKernel:
             tma_tape,
             tma_dv2,
             token.tiled_mma,
+            square.tiled_mma,
             plan.variants["mm_128_64_128_mn_k"].tiled_mma,
             plan.variants["mm_128_64_64_mn_k"].tiled_mma,
-            # One tiled MMA per qg^T dO issue site: each sets its accumulate
-            # flag inside its own dynamic branch.
+            # One tiled MMA per qg^T dO and dv^T issue site: each sets its
+            # accumulate flag inside its own dynamic branch.
             plan.variants["mm_128_64_64_mn_mn"].tiled_mma,
             plan.variants["mm_128_64_64_mn_mn"].tiled_mma,
         ).launch(
@@ -271,10 +284,11 @@ class KdaDhuKernel:
         tma_w,
         tma_qg,
         tma_do,
-        tma_dv,
+        tma_aqk,
         tma_tape,
         tma_dv2,
         mma_token,
+        mma_square,
         mma1,
         mma2,
         mma3_first,
@@ -292,8 +306,7 @@ class KdaDhuKernel:
         holding = storage.tmem_holding.data_ptr()
         if tidx == 0:
             for b in cutlass.range_constexpr(_NUM_BARRIERS):
-                count = _EMPTY_COUNT if b in (_B_EMPTY, _B_EMPTY + 1) else 1
-                cute.arch.mbarrier_init(bars + b, count)
+                cute.arch.mbarrier_init(bars + b, 1)
         cute.arch.mbarrier_init_fence()
         if warp == 0:
             tcgen05_ws.tmem_allocate(holding, _TMEM_COLUMNS)
@@ -309,36 +322,34 @@ class KdaDhuKernel:
         s_w = storage.sW.data_ptr()
         s_qg = storage.sQg.data_ptr()
         s_do = storage.sDo.data_ptr()
-        s_dv = storage.sDv.data_ptr()
+        s_aqk = storage.sAqk.data_ptr()
         s_s = storage.sS.data_ptr()
         s_dv2 = storage.sDv2.data_ptr()
+        s_out = storage.sOut.data_ptr()
 
         if warp < 4:
-            if cutlass.const_expr(_SET_REGISTERS):
-                cute.arch.setmaxregister_increase(_STATE_REGISTERS)
+            cute.arch.setmaxregister_increase(_STATE_REGISTERS)
             self.run_state(
                 tidx, warp, head, sequence, seq_start, seq_len, chunk_base, num_chunks,
                 bars, tmem, s_s, s_do, gc, dht, dh0, scale, tma_tape,
             )
         elif warp < 8:
-            if cutlass.const_expr(_SET_REGISTERS):
-                cute.arch.setmaxregister_decrease(_VALUE_REGISTERS)
+            cute.arch.setmaxregister_decrease(_VALUE_REGISTERS)
             self.run_value(
-                tidx - 128, warp, head, seq_start, seq_len, num_chunks, bars, tmem, s_dv, s_dv2,
+                tidx - 128, warp, head, seq_start, seq_len, num_chunks, bars, tmem, s_out, s_dv2,
                 dv2, scale, tma_dv2,
             )
         else:
-            if cutlass.const_expr(_SET_REGISTERS):
-                cute.arch.setmaxregister_decrease(_OTHER_REGISTERS)
+            cute.arch.setmaxregister_decrease(_OTHER_REGISTERS)
             if warp == _MMA_WARP:
                 self.run_mma(
-                    num_chunks, bars, tmem, s_kg, s_w, s_qg, s_do, s_s, s_dv2, mma1, mma2,
+                    num_chunks, bars, tmem, s_kg, s_w, s_qg, s_do, s_aqk, s_s, s_dv2, mma1, mma2,
                     mma3_first, mma3_next,
                 )
             elif warp == _TMA_WARP:
                 self.run_tma(
-                    head, seq_start, num_chunks, bars, (s_kg, s_w, s_qg, s_do, s_dv),
-                    (tma_kg, tma_w, tma_qg, tma_do, tma_dv), mma_token,
+                    head, seq_start, num_chunks, bars, (s_kg, s_w, s_qg, s_do, s_aqk),
+                    (tma_kg, tma_w, tma_qg, tma_do, tma_aqk), mma_token, mma_square,
                 )
         cute.arch.barrier(barrier_id=_BAR_ALL, number_of_threads=_THREADS)
         if warp == 0:
@@ -401,34 +412,53 @@ class KdaDhuKernel:
     # ---------------------------------------------------------------- TMA
 
     @cute.jit
-    def _tma(self, info, smem, tiled_mma, row, coord, bar):
+    def _tma(self, info, smem, tiled_mma, tile: cutlass.Constexpr, row, coord, bar):
         g = cute.domain_offset((row, cutlass.Int32(0)), info[1][None, None, coord])
-        g = tiled_mma.get_slice(0).partition_A(cute.flat_divide(g, (_BT, _DK)))
+        g = tiled_mma.get_slice(0).partition_A(cute.flat_divide(g, tile))
         s_part, g_part = cpasync.tma_partition(
             info[0], 0, cute.make_layout(1), cute.group_modes(smem, 0, 3), cute.group_modes(g, 0, 3)
         )
         cute.copy(info[0], g_part[(None, 0, 0)], s_part[(None, 0)], tma_bar_ptr=bar)
 
     @cute.jit
-    def run_tma(self, head, seq_start, num_chunks, bars, tiles, infos, mma_token):
+    def run_tma(self, head, seq_start, num_chunks, bars, tiles, infos, mma_token, mma_square):
         layout = self._plan.canonical_staged.token_direct
+        square = self._plan.canonical_staged.square_direct
         group = (cutlass.Int32(0), head)
         for j in cutlass.range(num_chunks):
             stage = j % 2
-            if j >= 2:
-                cute.arch.mbarrier_wait(bars + _B_EMPTY + stage, (j // 2 - 1) & 1)
             row = seq_start + (num_chunks - 1 - j) * _BT
-            bar = bars + _B_LOAD + stage
+            if j >= 2:
+                cute.arch.mbarrier_wait(bars + _B_EMPTY_A + stage, (j // 2 - 1) & 1)
+            bar = bars + _B_LOAD_A + stage
             with cute.arch.elect_one():
-                cute.arch.mbarrier_arrive_and_expect_tx(bar, _INPUTS * _TILE * 2)
-            for i in cutlass.range_constexpr(_INPUTS):
-                self._tma(infos[i], _view(tiles[i], layout, stage * _TILE), mma_token, row, group, bar)
+                cute.arch.mbarrier_arrive_and_expect_tx(bar, _BYTES_A)
+            for i in cutlass.range_constexpr(4):
+                if cutlass.const_expr(i != 1):
+                    self._tma(
+                        infos[i], _view(tiles[i], layout, stage * _TILE), mma_token, (_BT, _DK),
+                        row, group, bar,
+                    )
+            self._tma(
+                infos[4], _view(tiles[4], square, stage * _SQUARE), mma_square, (_BT, _BT), row,
+                group, bar,
+            )
+            if j >= 2:
+                cute.arch.mbarrier_wait(bars + _B_EMPTY_B + stage, (j // 2 - 1) & 1)
+            bar = bars + _B_LOAD_B + stage
+            with cute.arch.elect_one():
+                cute.arch.mbarrier_arrive_and_expect_tx(bar, _BYTES_B)
+            self._tma(
+                infos[1], _view(tiles[1], layout, stage * _TILE), mma_token, (_BT, _DK), row,
+                group, bar,
+            )
 
     # ---------------------------------------------------------------- MMA
 
     @cute.jit
-    def _gemm_qdo(self, tmem, mma3, s_qg, s_do, j):
-        """acc[j % 2] = qg^T dO for chunk j (two 64-column value halves)."""
+    def _gemm_qdo(self, tmem, mma3, s_qg, s_do, s_aqk, j):
+        """acc[j % 2] = qg^T dO for chunk j (two 64-column value halves), then
+        dv^T = dO^T Aqk into the dv2 accumulator."""
         stage = j % 2
         for hh in cutlass.range_constexpr(2):
             acc = self._acc(tmem, _ACC_DS + stage * 128 + hh * 64, mma3, (_DK, _BT))
@@ -439,10 +469,17 @@ class KdaDhuKernel:
                 self._operand("mm_128_64_64_mn_mn", s_do, "b", stage * _TILE + hh * _BT * _BT),
                 False,
             )
+        self._gemm(
+            mma3,
+            self._acc(tmem, _ACC_DV2, mma3, (_DV, _BT)),
+            self._operand("mm_128_64_64_mn_mn", s_do, "a", stage * _TILE),
+            self._operand("mm_128_64_64_mn_mn", s_aqk, "b", stage * _SQUARE),
+            False,
+        )
 
     @cute.jit
     def run_mma(
-        self, num_chunks, bars, tmem, s_kg, s_w, s_qg, s_do, s_s, s_dv2, mma1, mma2,
+        self, num_chunks, bars, tmem, s_kg, s_w, s_qg, s_do, s_aqk, s_s, s_dv2, mma1, mma2,
         mma3_first, mma3_next,
     ):
         acc1 = self._acc(tmem, _ACC_DV2, mma1, (_DV, _BT))
@@ -451,17 +488,19 @@ class KdaDhuKernel:
             cute.arch.mbarrier_wait(bars + _B_S_READY, j & 1)
             self._stamp(0, j)
             if j == 0:
-                cute.arch.mbarrier_wait(bars + _B_LOAD, 0)
-                self._gemm_qdo(tmem, mma3_first, s_qg, s_do, j)
-            # dv2^T = dS^T kg^T (value lanes, token columns).
+                cute.arch.mbarrier_wait(bars + _B_LOAD_A, 0)
+                self._gemm_qdo(tmem, mma3_first, s_qg, s_do, s_aqk, j)
+            # dv2^T = dv^T + dS^T kg^T (value lanes, token columns).
             self._gemm(
                 mma1,
                 acc1,
                 self._operand("mm_128_64_128_mn_k", s_s, "a"),
                 self._operand("mm_128_64_128_mn_k", s_kg, "b", stage * _TILE),
-                False,
+                True,
             )
             self._commit(bars + _B_D1)
+            self._commit(bars + _B_EMPTY_A + stage)
+            cute.arch.mbarrier_wait(bars + _B_LOAD_B + stage, (j // 2) & 1)
             cute.arch.mbarrier_wait(bars + _B_DV2_READY, j & 1)
             self._stamp(1, j)
             for hh in cutlass.range_constexpr(2):
@@ -474,12 +513,12 @@ class KdaDhuKernel:
                     True,
                 )
             self._commit(bars + _B_D2 + stage)
-            self._commit(bars + _B_EMPTY + stage)
+            self._commit(bars + _B_EMPTY_B + stage)
             if j + 1 < num_chunks:
                 # The next chunk's qg^T dO runs while the state warps update dS.
-                cute.arch.mbarrier_wait(bars + _B_LOAD + (j + 1) % 2, ((j + 1) // 2) & 1)
+                cute.arch.mbarrier_wait(bars + _B_LOAD_A + (j + 1) % 2, ((j + 1) // 2) & 1)
                 self._stamp(7, j)
-                self._gemm_qdo(tmem, mma3_next, s_qg, s_do, j + 1)
+                self._gemm_qdo(tmem, mma3_next, s_qg, s_do, s_aqk, j + 1)
 
     # -------------------------------------------------------------- state
 
@@ -522,7 +561,7 @@ class KdaDhuKernel:
             if j == 0:
                 if valid0 < _BT:
                     # Zero dO rows past the sequence end (stage 0 holds this chunk).
-                    cute.arch.mbarrier_wait(bars + _B_LOAD, 0)
+                    cute.arch.mbarrier_wait(bars + _B_LOAD_A, 0)
                     for r8 in cutlass.range_constexpr(_BT // 8):
                         row = r8 * 8 + tidx // 16
                         if row >= valid0:
@@ -589,47 +628,38 @@ class KdaDhuKernel:
 
     @cute.jit
     def run_value(
-        self, vtidx, warp, head, seq_start, seq_len, num_chunks, bars, tmem, s_dv, s_dv2, dv2, scale,
+        self, vtidx, warp, head, seq_start, seq_len, num_chunks, bars, tmem, s_out, s_dv2, dv2, scale,
         tma_dv2,
     ):
-        """Warps 4-7: thread = value channel; dv2 = dv + kg dS for one chunk."""
+        """Warps 4-7: thread = value channel; the dv2 rows of one chunk."""
         heads = self.heads
         lane_base = cutlass.Int32(tmem.toint()) + ((warp % 4) * 32 << 16)
         neg_inv_scale = -1.0 / scale
         out_base = cutlass.Int64(dv2.iterator.toint()) + head * _DV * 2
         token_stride = heads * _DV * 2
         buf = [cute.make_rmem_tensor((32,), cutlass.Float32) for _ in range(2)]
-        dvs = cute.make_rmem_tensor((_BT,), cutlass.Float32)
         out8 = cute.make_rmem_tensor((8,), cutlass.BFloat16)
         half_base = cutlass.Int32(s_dv2.toint()) + (vtidx // 64) * (_BT * _BT * 2)
+        # Column vtidx of the dv2 output tile: element (row, vtidx) is at
+        # bases[row % 8] + row * 128.
+        bases = _column_bases(cutlass.Int32(s_out.toint()), vtidx)
         for j in cutlass.range(num_chunks):
-            stage = j % 2
             chunk = num_chunks - 1 - j
             tok0 = seq_start + chunk * _BT
             valid = seq_len - chunk * _BT
             if valid > _BT:
                 valid = _BT
-            # Column vtidx of this stage's dv tile: element (row, vtidx) is at
-            # bases[row % 8] + row * 128.
-            bases = _column_bases(cutlass.Int32(s_dv.toint()) + stage * (_TILE * 2), vtidx)
-            cute.arch.mbarrier_wait(bars + _B_LOAD + stage, (j // 2) & 1)
-            if warp == 4:
-                self._stamp(6, j)
             cute.arch.mbarrier_wait(bars + _B_D1, j & 1)
             if warp == 4:
                 self._stamp(4, j)
             for h32 in cutlass.range_constexpr(_BT // 32):
                 _tmem_ldn_async(lane_base + _ACC_DV2 + h32 * 32, buf[h32], 32)
-            # All dv loads before the first store: the shared accesses are
-            # ordered, so interleaving them would serialize the loads.
-            for t in cutlass.range_constexpr(_BT):
-                dvs[t] = _lds_bf16(bases[t % 8] + t * 128)
             _tmem_wait_ld()
             for h32 in cutlass.range_constexpr(_BT // 32):
                 for c8 in cutlass.range_constexpr(4):
                     for e in cutlass.range_constexpr(8):
                         t = h32 * 32 + c8 * 8 + e
-                        x = buf[h32][c8 * 8 + e] + dvs[t]
+                        x = buf[h32][c8 * 8 + e]
                         if t >= valid:
                             x = cutlass.Float32(0.0)
                         _sts_bf16(bases[t % 8] + t * 128, x)
@@ -644,15 +674,15 @@ class KdaDhuKernel:
             cute.arch.barrier(barrier_id=_BAR_VALUE, number_of_threads=128)
             if vtidx == 0:
                 cute.arch.mbarrier_arrive(bars + _B_DV2_READY)
-            # dv2 rows out of the dv tile: one bulk store for a full chunk; a
-            # partial chunk must not touch the next sequence's rows.
+            # dv2 rows out: one bulk store for a full chunk; a partial chunk
+            # must not touch the next sequence's rows.  The tile is rewritten
+            # only after the barrier below.
             if valid == _BT:
                 if vtidx == 0:
-                    self._tma_store(tma_dv2, s_dv + stage * _TILE, _BT, tok0, (cutlass.Int32(0), head))
+                    self._tma_store(tma_dv2, s_out, _BT, tok0, (cutlass.Int32(0), head))
                     cute.arch.cp_async_bulk_wait_group(0, read=True)
-                    cute.arch.mbarrier_arrive(bars + _B_EMPTY + stage)
             else:
-                tile_base = cutlass.Int32(s_dv.toint()) + stage * (_TILE * 2)
+                tile_base = cutlass.Int32(s_out.toint())
                 for i in cutlass.range_constexpr(_BT * _DV // 8 // 128):
                     index = i * 128 + vtidx
                     row = index // 16
@@ -662,6 +692,4 @@ class KdaDhuKernel:
                             _swz_token(tile_base, row, col),
                             out_base + cutlass.Int64(tok0 + row) * token_stride + col * 2,
                         )
-                cute.arch.barrier(barrier_id=_BAR_VALUE, number_of_threads=128)
-                if vtidx == 0:
-                    cute.arch.mbarrier_arrive(bars + _B_EMPTY + stage)
+            cute.arch.barrier(barrier_id=_BAR_VALUE, number_of_threads=128)

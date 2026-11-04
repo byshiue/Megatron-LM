@@ -191,13 +191,17 @@ def fused_kda_bwd(
 
 
 def kda_dhu(
-    kg, w, qg, do, dv, gc, dht, cu_seqlens, scale, *, chunk_offsets=None, num_chunks=None, trace=False
+    q, k, gc, beta, aqk, akk, do, dht, cu_seqlens, scale, *, chunk_offsets=None, num_chunks=None,
+    trace=False,
 ):
-    """KDA's backward state recurrence (FLA's ``chunk_gated_delta_rule_bwd_dhu`` with ``gk``).
+    """KDA's backward state recurrence from the forward residuals.
 
-    ``kg``, ``w``, ``qg``, ``do`` and ``dv`` are BF16 ``[1, T, H, 128]`` (FLA's
-    ``recompute_w_u_fwd`` and ``chunk_kda_bwd_dAv`` outputs), ``gc`` the FP32
-    chunk-local log2 gate cumsum and ``dht`` the FP32 ``[S, H, 128, 128]``
+    Computes FLA's ``recompute_w_u_fwd`` (w, qg, kg), ``chunk_kda_bwd_dAv``
+    (dv) and ``chunk_gated_delta_rule_bwd_dhu`` with ``gk``: a chunk-parallel
+    Triton prep (``prep``) followed by the CuTe DSL recurrence (``dhu``).
+    ``q``, ``k`` and ``do`` are BF16 ``[1, T, H, 128]``, ``gc`` the FP32
+    chunk-local log2 gate cumsum, ``beta`` FP32 ``[1, T, H]``, ``aqk`` and
+    ``akk`` BF16 ``[1, T, H, 64]`` and ``dht`` the FP32 ``[S, H, 128, 128]``
     final-state gradient; ``num_chunks`` (default: an upper bound) sizes the
     tape like the forward's ``h``.  Returns ``(dh, dh0, dv2)``: the BF16 per-chunk dS
     ``[1, C, H, 128, 128]``, the FP32 initial-state gradient and BF16 dv_new.
@@ -208,24 +212,29 @@ def kda_dhu(
     from cutlass.cute.runtime import from_dlpack
 
     from .dhu import KdaDhuKernel
+    from .prep import kda_dhu_prep
 
     if chunk_offsets is None:
         chunk_offsets = chunk_offsets_for(cu_seqlens)
-    _, tokens, heads, _ = kg.shape
-    device = kg.device
-    for name, tensor in (("kg", kg), ("w", w), ("qg", qg), ("do", do), ("dv", dv)):
+    _, tokens, heads, _ = q.shape
+    device = q.device
+    for name, tensor in (("q", q), ("k", k), ("do", do)):
         _require(name, tensor, torch.bfloat16, (1, tokens, heads, _D), device)
     _require("gc", gc, torch.float32, (1, tokens, heads, _D), device)
+    _require("beta", beta, torch.float32, (1, tokens, heads), device)
+    _require("aqk", aqk, torch.bfloat16, (1, tokens, heads, _BT), device)
+    _require("akk", akk, torch.bfloat16, (1, tokens, heads, _BT), device)
     num_sequences = cu_seqlens.numel() - 1
     _require("dht", dht, torch.float32, (num_sequences, heads, _D, _D), device)
     if num_chunks is None:
         num_chunks = (tokens + _BT - 1) // _BT + num_sequences
+    qg, kg, w, aqk_masked = kda_dhu_prep(q, k, gc, beta, aqk, akk, cu_seqlens, chunk_offsets, num_chunks)
     dh = torch.empty((1, num_chunks, heads, _D, _D), device=device, dtype=torch.bfloat16)
-    dv2 = torch.empty_like(dv)
+    dv2 = torch.empty_like(do)
     dh0 = torch.empty_like(dht)
     trace_out = torch.zeros((8, 16) if trace else (1, 1), device=device, dtype=torch.int64)
     args = (
-        *(_dynamic(t, 1) for t in (kg, w, qg, do, dv, gc)),
+        *(_dynamic(t, 1) for t in (kg, w, qg, do, aqk_masked, gc)),
         _dynamic(dht, 0),
         _dynamic(cu_seqlens, 0, align=4),
         _dynamic(chunk_offsets, 0, align=4),
